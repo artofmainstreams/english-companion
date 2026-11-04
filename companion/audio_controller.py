@@ -6,6 +6,7 @@ import time
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtMultimedia import (
+    QAudioDevice,
     QAudioInput,
     QAudioOutput,
     QMediaCaptureSession,
@@ -37,6 +38,10 @@ class AudioController(QObject):
     """
 
     state_changed = Signal()
+    # Список устройств ввода изменился (подключение/отключение микрофона):
+    # интерфейс перечитывает список; если выбранный микрофон пропал,
+    # контроллер сам возвращается к системному устройству.
+    devices_changed = Signal()
 
     IDLE = "idle"
     RECORDING = "recording"
@@ -54,6 +59,20 @@ class AudioController(QObject):
         # источник по URL: если записывать поверх того же пути, setSource()
         # вернёт уже декодированную (старую) запись, а не перечитает файл.
         self._record_seq = 0
+
+        # Выбранное устройство ввода: ``None`` — системное устройство
+        # по умолчанию. Идентификатор берём из ``QAudioDevice.id()`` —
+        # он стабилен для сессии, в отличие от порядкового номера в списке.
+        self._selected_input_id: str | None = None
+
+        # Подключение/отключение устройств (статический сигнал класса,
+        # без аргументов). В этой сборке PySide6 его нельзя подключить
+        # через класс (нет ``connect``) — держим экземпляр QMediaDevices
+        # и подключаем через него; список перечитываем по факту.
+        self._devices = QMediaDevices()
+        self._devices.audioInputsChanged.connect(
+            self._on_input_devices_changed
+        )
 
         # Граф записи создаётся на каждый сеанс, чтобы корректно
         # освобождать микрофон и пересоздавать устройство ввода.
@@ -103,6 +122,11 @@ class AudioController(QObject):
         )
 
     @property
+    def is_shutdown(self) -> bool:
+        """``True`` после ``shutdown()``: контроллер больше не работает."""
+        return self._shutdown
+
+    @property
     def last_recording_path(self) -> str | None:
         """Публичный доступ к пути последней завершённой записи.
 
@@ -113,6 +137,65 @@ class AudioController(QObject):
         if self.has_recording and self._record_file is not None:
             return self._record_file
         return None
+
+    def input_device_names(self) -> list[str]:
+        """Названия доступных устройств ввода (для списка в интерфейсе)."""
+        return [
+            dev.description()
+            for dev in QMediaDevices.audioInputs()
+            if not dev.isNull()
+        ]
+
+    def selected_input_name(self) -> str | None:
+        """Название выбранного микрофона; ``None`` — системное устройство.
+
+        Ищет устройство по идентификатору: если микрофон отключили,
+        имя вернёт ``None`` (как бы выбор сбросился — факт отключения
+        отражает ``_reselect_if_needed()``).
+        """
+        if self._selected_input_id is None:
+            return None
+        for dev in QMediaDevices.audioInputs():
+            if not dev.isNull() and self._device_id(dev) == self._selected_input_id:
+                return dev.description()
+        return None
+
+    def set_input_device(self, name_or_id: str | None) -> bool:
+        """Выбирает микрофон по названию или идентификатору.
+
+        ``None`` — вернуться к системному устройству по умолчанию.
+        Возвращает ``False`` (и объясняет почему в ``status``), если:
+        контроллер остановлен, идёт запись (переключение запрещено)
+        или устройство не найдено.
+        """
+        if self._shutdown:
+            return False
+        if self.state == self.RECORDING:
+            self.status = (
+                "Сначала останови запись: во время записи "
+                "переключать микрофон нельзя."
+            )
+            self.state_changed.emit()
+            return False
+
+        if name_or_id is None:
+            self._selected_input_id = None
+            self.status = "Микрофон: системный (по умолчанию)."
+            self.state_changed.emit()
+            return True
+
+        for dev in QMediaDevices.audioInputs():
+            if dev.isNull():
+                continue
+            if dev.description() == name_or_id or self._device_id(dev) == name_or_id:
+                self._selected_input_id = self._device_id(dev)
+                self.status = f"Микрофон: {dev.description()}"
+                self.state_changed.emit()
+                return True
+
+        self.status = f"Микрофон «{name_or_id}» не найден — выбор не изменён."
+        self.state_changed.emit()
+        return False
 
     # --- Публичные действия ------------------------------------------------
 
@@ -127,7 +210,9 @@ class AudioController(QObject):
         # Гарантированно чистим предыдущую сессию записи.
         self._teardown_recording()
 
-        device = QMediaDevices.defaultAudioInput()
+        # Выбранный микрофон; при его отсутствии разрешается
+        # в системное устройство (см. _selected_input_device).
+        device = self._selected_input_device()
         if device.isNull():
             self.status = (
                 "Нет микрофона. Подключи устройство ввода звука."
@@ -276,6 +361,17 @@ class AudioController(QObject):
             return
         self._shutdown = True
 
+        # 0) Снимаем обработчик hotplug-сигнала и отпускаем экземпляр
+        #    QMediaDevices, чтобы поздние события не доходили до мёртвого
+        #    контроллера.
+        if self._devices is not None:
+            try:
+                self._devices.audioInputsChanged.disconnect(
+                    self._on_input_devices_changed
+                )
+            except (TypeError, RuntimeError):
+                pass  # сигнал уже снят (повторный shutdown) — нормально
+
         # 1) Выход: явное отсоединение от плеера (setAudioOutput(None)) и
         #    снятие связей, затем отложенное удаление. Раньше здесь был
         #    только deleteLater(), и корректность зависела от порядка
@@ -315,6 +411,52 @@ class AudioController(QObject):
             self.state_changed.emit()
         elif state == QMediaRecorder.RecorderState.StoppedState:
             self._finalize_recording()
+
+    def _on_input_devices_changed(self) -> None:
+        """Список входов изменился (подключили/отключили устройство)."""
+        if self._shutdown:
+            return
+        # Если выбранный микрофон пропал — возвращаемся к системному,
+        # чтобы запись не упала на «пустом» устройстве.
+        self._reselect_if_needed()
+        self.devices_changed.emit()
+
+    def _reselect_if_needed(self) -> None:
+        """Выбранный микрофон отсутствует — сбрасываем выбор на системный.
+
+        Вызывается при hotplug; безопасна к повторным вызовам и к
+        случаю, когда выбран системный (``None``) — тогда ничего не делает.
+        """
+        if self._selected_input_id is None:
+            return
+        for dev in QMediaDevices.audioInputs():
+            if (
+                not dev.isNull()
+                and self._device_id(dev) == self._selected_input_id
+            ):
+                return  # выбранный микрофон ещё на месте
+        self._selected_input_id = None
+        self.status = (
+            "Выбранный микрофон отключён — запись пойдёт через "
+            "системное устройство по умолчанию."
+        )
+        self.state_changed.emit()
+
+    def _selected_input_device(self) -> QAudioDevice:
+        """Разрешает выбранный микрофон; при отсутствии — системный."""
+        if self._selected_input_id is not None:
+            for dev in QMediaDevices.audioInputs():
+                if (
+                    not dev.isNull()
+                    and self._device_id(dev) == self._selected_input_id
+                ):
+                    return dev
+        return QMediaDevices.defaultAudioInput()
+
+    @staticmethod
+    def _device_id(device: QAudioDevice) -> str:
+        """Строковый идентификатор устройства (``QAudioDevice.id()``)."""
+        return device.id().data().decode("utf-8", "replace")
 
     def _on_recorder_error(
         self, error: QMediaRecorder.Error, message: str

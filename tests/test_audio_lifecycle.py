@@ -202,6 +202,108 @@ class TestSaveRecording(unittest.TestCase):
         self.assertIsNone(self.c.save_last_recording(self.dest_dir))
 
 
+class TestInputDeviceSelection(unittest.TestCase):
+    """Выбор устройства ввода: выбор/сброс, hotplug-фолбэк, сторожевые флаги.
+
+    Реальный захват звука не включается — проверяется логика выбора
+    (разрешение устройства, статусы, сигналы), а не запись.
+    """
+
+    def setUp(self) -> None:
+        _app()
+        self.c = AudioController()
+
+    def tearDown(self) -> None:
+        self.c.shutdown()
+        _pump(0.1)
+        del self.c
+
+    def test_default_is_system_device(self) -> None:
+        """Без явного выбора записывается системное устройство по умолчанию."""
+        if not _has_audio_input():
+            self.skipTest("нет устройств ввода — выбрать нечего")
+        self.assertIsNone(self.c._selected_input_id)
+        self.assertIsNone(self.c.selected_input_name())
+        device = self.c._selected_input_device()
+        self.assertFalse(device.isNull())
+        self.assertEqual(
+            device.id(),
+            QMediaDevices.defaultAudioInput().id(),
+            "без выбора должен разрешаться системный микрофон",
+        )
+
+    def test_select_and_clear_valid_device(self) -> None:
+        """Выбор по названию фиксируется; ``None`` возвращает системный."""
+        names = self.c.input_device_names()
+        if not names:
+            self.skipTest("нет устройств ввода — выбрать нечего")
+        name = names[0]
+        self.assertTrue(self.c.set_input_device(name), self.c.status)
+        self.assertEqual(self.c.selected_input_name(), name)
+        self.assertIn(name, self.c.status)
+        # Разрешение: устройство с тем же идентификатором, что выбрано.
+        device = self.c._selected_input_device()
+        self.assertEqual(self.c._device_id(device), self.c._selected_input_id)
+
+        self.assertTrue(self.c.set_input_device(None), self.c.status)
+        self.assertIsNone(self.c.selected_input_name())
+        self.assertIn("системный", self.c.status)
+
+    def test_unknown_device_rejected(self) -> None:
+        """Несуществующий микрофон отклоняется; выбор не меняется."""
+        self.c._selected_input_id = "sentinel-id"
+        self.assertFalse(self.c.set_input_device("Нет-такого-микрофона"))
+        self.assertIn("не найден", self.c.status)
+        self.assertEqual(self.c._selected_input_id, "sentinel-id")
+
+    def test_switch_rejected_while_recording(self) -> None:
+        """Во время записи переключение запрещено (требование)."""
+        self.c.state = self.c.RECORDING
+        try:
+            self.assertFalse(self.c.set_input_device("Любой"))
+            self.assertIn("записи", self.c.status)
+            self.assertIsNone(self.c._selected_input_id)
+            # И сброс на системный тоже запрещён — это тоже переключение.
+            self.assertFalse(self.c.set_input_device(None))
+        finally:
+            self.c.state = self.c.IDLE
+
+    def test_reselect_falls_back_when_device_disappears(self) -> None:
+        """Микрофон отключили: выбор сбрасывается на системный + сигнал."""
+        self.c._selected_input_id = "b'gone-mic:input'"
+        changed: list[int] = []
+        self.c.devices_changed.connect(lambda: changed.append(1))
+
+        self.c._reselect_if_needed()
+        self.assertIsNone(self.c._selected_input_id)
+        self.assertIn("системное устройство", self.c.status)
+
+        # Полный обработчик hotplug: после фолбэка уходит devices_changed.
+        self.c._on_input_devices_changed()
+        self.assertEqual(changed, [1])
+        self.assertIsNone(self.c._selected_input_id)
+
+    def test_reselect_noop_when_system_selected(self) -> None:
+        """Системный (None) выбранный: hotplug-фолбэк ничего не делает."""
+        status_before = self.c.status
+        self.c._selected_input_id = None
+        self.c._reselect_if_needed()
+        self.assertIsNone(self.c._selected_input_id)
+        self.assertEqual(self.c.status, status_before)
+
+    def test_set_input_device_rejected_after_shutdown(self) -> None:
+        self.c.shutdown()
+        self.assertFalse(self.c.set_input_device(None))
+        self.assertFalse(self.c.set_input_device("Любой"))
+
+    def test_hotplug_handler_is_noop_after_shutdown(self) -> None:
+        self.c.shutdown()
+        changed: list[int] = []
+        self.c.devices_changed.connect(lambda: changed.append(1))
+        self.c._on_input_devices_changed()
+        self.assertEqual(changed, [])
+
+
 class TestAudioPlayback(unittest.TestCase):
     """Воспроизведение: реальный выход (сценарий на тихом WAV)."""
 

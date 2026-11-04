@@ -65,6 +65,12 @@ class MainWindow(QMainWindow):
         self.audio_status_label = QLabel("Голос: готов")
         self.stt_status_label = QLabel("Распознавание: готов")
 
+        # Выбор устройства ввода: позиция 0 — «Системный (по умолчанию)»,
+        # дальше — доступные микрофоны. Во время записи переключение
+        # запрещено (комбо заблокировано, контроллер его тоже отклонит).
+        self.mic_combo = QComboBox()
+        self.mic_combo.setMinimumWidth(180)
+
         self.send_button.clicked.connect(self.send_message)
         self.message_input.returnPressed.connect(self.send_message)
         self.message_input.textChanged.connect(self.update_send_button)
@@ -76,6 +82,7 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_play)
         self.recognize_button.clicked.connect(self.start_recognition)
         self.save_button.clicked.connect(self.save_recording)
+        self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(self.message_input)
@@ -86,6 +93,8 @@ class MainWindow(QMainWindow):
         audio_layout.addWidget(self.play_button)
         audio_layout.addWidget(self.recognize_button)
         audio_layout.addWidget(self.save_button)
+        audio_layout.addWidget(QLabel("Микрофон:"))
+        audio_layout.addWidget(self.mic_combo)
         audio_layout.addWidget(self.audio_status_label, 1)
         audio_layout.addWidget(self.stt_status_label)
 
@@ -108,11 +117,13 @@ class MainWindow(QMainWindow):
         controller.state_changed.connect(self.render_state)
         controller.message_added.connect(self.append_message)
         audio.state_changed.connect(self.render_audio)
+        audio.devices_changed.connect(self._refresh_mic_combo)
         stt.state_changed.connect(self._on_stt_state_changed)
         stt.recognized.connect(self._on_stt_recognized)
         stt.failed.connect(self._on_stt_failed)
         self.render_state()
         self.render_audio()
+        self._refresh_mic_combo()
         self._on_stt_state_changed()
 
     def render_state(self) -> None:
@@ -160,6 +171,12 @@ class MainWindow(QMainWindow):
         # has_recording становится False (путь сбрасывается).
         self.save_button.setEnabled(audio.has_recording)
 
+        # Переключение микрофона — только вне записи (требование);
+        # после shutdown контроллер не работает, комбо блокируем тоже.
+        self.mic_combo.setEnabled(
+            not audio.is_shutdown and audio.state != audio.RECORDING
+        )
+
         self.audio_status_label.setText(audio.status)
         self._render_recognize_button()
 
@@ -172,6 +189,33 @@ class MainWindow(QMainWindow):
             and audio.has_recording
             and audio.state != audio.RECORDING
         )
+
+    def _refresh_mic_combo(self) -> None:
+        """Перечитывает список микрофонов, сохраняя текущий выбор.
+
+        Вызывается при старте окна и при каждом изменении списка
+        (подключение/отключение устройства). Сигналы комбо на время
+        перестроения блокированы, чтобы «сброс» индекса не сбивал выбор.
+        """
+        audio = self.audio
+        selected = audio.selected_input_name()
+        items = ["Системный (по умолчанию)"] + audio.input_device_names()
+        with QSignalBlocker(self.mic_combo):
+            self.mic_combo.clear()
+            self.mic_combo.addItems(items)
+            self.mic_combo.setCurrentIndex(
+                max(self.mic_combo.findText(selected), 0)
+                if selected is not None
+                else 0
+            )
+        self.render_audio()  # статус контроллера + состояние кнопок
+
+    def _on_mic_changed(self) -> None:
+        """Позиция 0 — системное устройство; дальше — конкретный микрофон."""
+        if self.mic_combo.currentIndex() <= 0:
+            self.audio.set_input_device(None)
+        else:
+            self.audio.set_input_device(self.mic_combo.currentText())
 
     def _on_stt_state_changed(self) -> None:
         self.stt_status_label.setText(self.stt.status)
