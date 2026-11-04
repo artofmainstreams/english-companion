@@ -6,7 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "english-companion"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
-dependencies = ["PySide6>=6.8,<7"]
+dependencies = [
+    "PySide6>=6.8,<7",
+    # Локальное STT. Тяжёлые нативные зависимости (ctranslate2, onnxruntime,
+    # av) имеют arm64-колёса для macOS и Python 3.13.
+    "faster-whisper>=1.2,<2",
+    # PyAV 18+ убрали аргумент metadata_errors у av.open(), который
+    # faster-whisper 1.2.1 по-прежнему передаёт (иначе decode_audio падает).
+    "av>=11,<18",
+]
 
 [tool.setuptools.packages.find]
 include = ["companion*"]

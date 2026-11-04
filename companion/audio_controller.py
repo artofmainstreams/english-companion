@@ -97,6 +97,18 @@ class AudioController(QObject):
             and self.has_recording
         )
 
+    @property
+    def last_recording_path(self) -> str | None:
+        """Публичный доступ к пути последней завершённой записи.
+
+        Возвращает путь к файлу, если запись существует и непуста, иначе
+        ``None``. Из окна берётся путь именно через это свойство, а не через
+        приватные поля контроллера.
+        """
+        if self.has_recording and self._record_file is not None:
+            return self._record_file
+        return None
+
     # --- Публичные действия ------------------------------------------------
 
     def record(self) -> None:

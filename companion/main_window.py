@@ -10,11 +10,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
 
 from .session_controller import SessionController
 from .audio_controller import AudioController
+from .stt_engine import SttEngine
 from .message import Message
 
 
@@ -23,6 +25,7 @@ class MainWindow(QMainWindow):
         self,
         controller: SessionController,
         audio: AudioController,
+        stt: SttEngine,
     ) -> None:
         super().__init__()
 
@@ -31,6 +34,10 @@ class MainWindow(QMainWindow):
 
         self.controller = controller
         self.audio = audio
+        self.stt = stt
+        # Отложенное закрытие окна: если при попытке закрыть Speech
+        # ещё работает, завершаем работу и закрываем её позже.
+        self._pending_close = False
 
         self.history = QPlainTextEdit()
         self.history.setReadOnly(True)
@@ -53,7 +60,9 @@ class MainWindow(QMainWindow):
 
         self.record_button = QPushButton("Записать")
         self.play_button = QPushButton("Прослушать")
+        self.recognize_button = QPushButton("Распознать")
         self.audio_status_label = QLabel("Голос: готов")
+        self.stt_status_label = QLabel("Распознавание: готов")
 
         self.send_button.clicked.connect(self.send_message)
         self.message_input.returnPressed.connect(self.send_message)
@@ -64,6 +73,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(controller.load_models)
         self.record_button.clicked.connect(self.toggle_record)
         self.play_button.clicked.connect(self.toggle_play)
+        self.recognize_button.clicked.connect(self.start_recognition)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(self.message_input)
@@ -72,7 +82,9 @@ class MainWindow(QMainWindow):
         audio_layout = QHBoxLayout()
         audio_layout.addWidget(self.record_button)
         audio_layout.addWidget(self.play_button)
+        audio_layout.addWidget(self.recognize_button)
         audio_layout.addWidget(self.audio_status_label, 1)
+        audio_layout.addWidget(self.stt_status_label)
 
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("Модель:"))
@@ -93,8 +105,12 @@ class MainWindow(QMainWindow):
         controller.state_changed.connect(self.render_state)
         controller.message_added.connect(self.append_message)
         audio.state_changed.connect(self.render_audio)
+        stt.state_changed.connect(self._on_stt_state_changed)
+        stt.recognized.connect(self._on_stt_recognized)
+        stt.failed.connect(self._on_stt_failed)
         self.render_state()
         self.render_audio()
+        self._on_stt_state_changed()
 
     def render_state(self) -> None:
         controller = self.controller
@@ -124,11 +140,13 @@ class MainWindow(QMainWindow):
 
     def render_audio(self) -> None:
         audio = self.audio
+        stt_busy = self.stt.is_busy
         recording = audio.state == audio.RECORDING
         playing = audio.state == audio.PLAYING
 
+        # Во время распознавания новую запись запрещаем: файл ещё нужен.
         self.record_button.setEnabled(
-            audio.can_record or recording
+            (audio.can_record and not stt_busy) or recording
         )
         self.record_button.setText("Остановить" if recording else "Записать")
 
@@ -136,11 +154,91 @@ class MainWindow(QMainWindow):
         self.play_button.setText("Стоп" if playing else "Прослушать")
 
         self.audio_status_label.setText(audio.status)
+        self._render_recognize_button()
+
+    def _render_recognize_button(self) -> None:
+        # Кнопка доступна для завершённой записи и заблокирована, пока
+        # идёт распознавание или идёт запись.
+        audio = self.audio
+        self.recognize_button.setEnabled(
+            self.stt.state == self.stt.IDLE
+            and audio.has_recording
+            and audio.state != audio.RECORDING
+        )
+
+    def _on_stt_state_changed(self) -> None:
+        self.stt_status_label.setText(self.stt.status)
+        self._render_recognize_button()
+        # Кнопка записи тоже зависит от занятости STT.
+        self.render_audio()
+        # Если закрытие было отложено из-за активной работы — завершаем.
+        if self._pending_close and not self.stt.is_busy:
+            self._pending_close = False
+            self.close()
+
+    def _on_stt_recognized(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            # Пустой результат не должен стирать введённый текст.
+            self.stt_status_label.setText(
+                "Распознавание не дало текста; введённый текст сохранён."
+            )
+            self.status_label.setText("Речь не распознана (пустой результат).")
+            return
+
+        current = self.message_input.text().strip()
+        if current:
+            answer = QMessageBox.question(
+                self,
+                "Заменить текст?",
+                "В поле уже есть текст. Заменить его результатом "
+                "распознавания?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.stt_status_label.setText(
+                    "Текст не изменён (подтверждение отменено)."
+                )
+                self.status_label.setText(
+                    "Распознанный текст проигнорирован; поле не изменено."
+                )
+                return
+
+        self.message_input.setText(text)
+        self.message_input.setFocus()
+        self.stt_status_label.setText("Распознавание: готов")
+        self.status_label.setText(
+            "Текст распознан. Проверь и отправь вручную."
+        )
+
+    def _on_stt_failed(self, message: str) -> None:
+        self.stt_status_label.setText(message)
+        self.status_label.setText("Ошибка распознавания.")
+
+    def start_recognition(self) -> None:
+        # Путь берём из публичного API контроллера, не трогая приватные поля.
+        audio_path = self.audio.last_recording_path
+        if audio_path is None:
+            self.status_label.setText(
+                "Сначала запиши речь, потом нажми «Распознать»."
+            )
+            return
+        if self.stt.is_busy:
+            return
+        self.stt.recognize(audio_path)
 
     def toggle_record(self) -> None:
         if self.audio.state == self.audio.RECORDING:
             self.audio.stop_recording()
         else:
+            # Во время STT новую запись запрещаем: файл ещё читается.
+            if self.stt.is_busy:
+                self.status_label.setText(
+                    "Дождись окончания распознавания, чтобы начать запись."
+                )
+                return
             self.audio.record()
 
     def toggle_play(self) -> None:
@@ -148,6 +246,29 @@ class MainWindow(QMainWindow):
             self.audio.stop_playback()
         else:
             self.audio.play()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — имя из Qt
+        # Если STT ещё работает — нельзя закрываться: файл читается, а
+        # прерывать вычисление безопасно нельзя. Откладываем закрытие.
+        if self.stt.is_busy:
+            self._pending_close = True
+            self.stt_status_label.setText(
+                "Завершаю распознавание… закрытие отложено."
+            )
+            self.status_label.setText(
+                "Идёт распознавание. Окно закроется после завершения."
+            )
+            event.ignore()
+            return
+
+        self._shutdown_for_close()
+        event.accept()
+
+    def _shutdown_for_close(self) -> None:
+        # Порядок важен: STT завершается и освобождает файл, потом
+        # AudioController удаляет временные файлы.
+        self.stt.shutdown()
+        self.audio.shutdown()
 
     def send_message(self) -> None:
         if self.controller.send_message(self.message_input.text()):
