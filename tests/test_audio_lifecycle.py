@@ -4,15 +4,21 @@
 
     .venv/bin/python -m unittest discover -s tests -v
 
-или только «безопасный» набор, который не требует оборудования::
+— безопасные тесты контроллера (идемпотентность shutdown, сторожевые
+флаги); к устройствам звука они не обращаются и проходят без них.
 
-    .venv/bin/python -m unittest tests.test_audio_lifecycle.TestControllerGuards -v
+Полный прогон с реальными записью и воспроизведением (нужны микрофон,
+выход звука и разрешения macOS)::
 
-Обычный запуск проходит даже без аудиооборудования: классы
-``TestAudioPlayback`` и ``TestAudioRecording`` помечены ``skipUnless``
-(нужны реальные устройство вывода / микрофон и разрешения ОС) и
-пропускаются (SKIP), а не падают, когда устройств нет. На машине, где
-есть звук, все проверки выполняются полностью.
+    RUN_AUDIO_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
+
+Семантика результатов:
+* RUN_AUDIO_TESTS не задан — реальные аудиотесты SKIP без запроса
+  устройств;
+* устройство отсутствует — допустимая причина SKIP;
+* отказ записи/воспроизведения уже после начала сценария, пустой файл
+  записи и неверное состояние — FAIL: это дефект контроллера, а не
+  особенность окружения.
 """
 
 import faulthandler
@@ -49,6 +55,17 @@ def _pump(seconds: float) -> None:
     loop = QEventLoop()
     QTimer.singleShot(int(seconds * 1000), loop.quit)
     loop.exec()
+
+
+def _audio_tests_enabled() -> bool:
+    """Реальные аудиотесты включаются только явным флагом."""
+    return os.environ.get("RUN_AUDIO_TESTS") == "1"
+
+
+def _skip_if_audio_tests_disabled() -> None:
+    raise unittest.SkipTest(
+        "RUN_AUDIO_TESTS не равен 1 — реальные аудиотесты отключены"
+    )
 
 
 def _has_audio_input() -> bool:
@@ -119,12 +136,16 @@ class TestControllerGuards(unittest.TestCase):
         self.assertFalse(self.c.can_play)
 
 
-@unittest.skipUnless(
-    _has_audio_output(),
-    "нет устройства вывода звука — тест зависит от оборудования",
-)
 class TestAudioPlayback(unittest.TestCase):
-    """Воспроизведение: нужен реальный выход (сценарии на тихом WAV)."""
+    """Воспроизведение: реальный выход (сценарий на тихом WAV)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _audio_tests_enabled():
+            _skip_if_audio_tests_disabled()
+        if not _has_audio_output():
+            raise unittest.SkipTest("нет устройства вывода звука")
+        super().setUpClass()
 
     def setUp(self) -> None:
         _app()
@@ -134,12 +155,10 @@ class TestAudioPlayback(unittest.TestCase):
         _make_silent_wav(self.wav)
         self.c._temp_dir = self.tmp
         self.c._record_file = self.wav
+        # Старт сценария. Если он не запускается, тест сам сообщит FAIL
+        # (устройство же проверено в setUpClass) — а не пропустится.
         self.c.play()
         _pump(0.5)
-        if self.c.state != AudioController.PLAYING:
-            self.c.shutdown()
-            _pump(0.2)
-            self.skipTest(f"воспроизведение не стартовало: {self.c.status!r}")
 
     def tearDown(self) -> None:
         self.c.shutdown()
@@ -162,12 +181,18 @@ class TestAudioPlayback(unittest.TestCase):
         self.assertEqual(self.c.state, AudioController.IDLE)
 
 
-@unittest.skipUnless(
-    _has_audio_input(),
-    "нет микрофона — тест зависит от оборудования и разрешений",
-)
 class TestAudioRecording(unittest.TestCase):
-    """Запись: нужен реальный микрофон (и разрешения ОС)."""
+    """Запись: реальный микрофон (и разрешения ОС)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _audio_tests_enabled():
+            _skip_if_audio_tests_disabled()
+        if not _has_audio_input():
+            raise unittest.SkipTest(
+                "нет микрофона — аудиотесты требуют оборудования"
+            )
+        super().setUpClass()
 
     def setUp(self) -> None:
         _app()
@@ -176,54 +201,84 @@ class TestAudioRecording(unittest.TestCase):
     def tearDown(self) -> None:
         self.c.shutdown()
         _pump(0.2)
-        if self.c._temp_dir is not None and os.path.isdir(self.c._temp_dir):
-            shutil.rmtree(self.c._temp_dir, ignore_errors=True)
+        temp_dir = self.c._temp_dir
+        if temp_dir is not None and os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
         del self.c
 
     def test_shutdown_during_recording(self) -> None:
         """Закрытие окна во время записи: без падений, микрофон и файлы отпущены."""
         self.c.record()
         _pump(2.0)
-        if self.c.state != AudioController.RECORDING:
-            self.skipTest(f"запись не стартовала: {self.c.status!r}")
+        # Устройство проверено в setUpClass, значит «не стартовала» —
+        # это отказ уже начавшегося сценария, а не SKIP.
+        self.assertEqual(
+            self.c.state,
+            AudioController.RECORDING,
+            f"запись не стартовала: {self.c.status!r}",
+        )
+        # Путь сохраняем до shutdown(): проверяем фактическое удаление
+        # каталога, а не только None в поле контроллера.
+        temp_dir = self.c._temp_dir
+        record_file = self.c._record_file
         self.c.shutdown()
         _pump(0.5)
-        self.assertIsNone(self.c._temp_dir)
-        self.assertIsNone(self.c._record_file)
+        self.assertFalse(
+            os.path.isdir(temp_dir or ""),
+            f"каталог записи не удалён: {temp_dir!r}",
+        )
+        if record_file is not None:
+            self.assertFalse(
+                os.path.exists(record_file),
+                f"файл записи остался: {record_file!r}",
+            )
         self.assertEqual(self.c.state, AudioController.IDLE)
         self.c.shutdown()  # идемпотентность
         self.assertEqual(self.c.state, AudioController.IDLE)
 
-    @unittest.skipUnless(
-        _has_audio_output(),
-        "нет устройства вывода звука — цикл record→play невозможен",
-    )
     def test_record_play_cycles(self) -> None:
         """Несколько циклов record→stop→play→stop без висячих ссылок."""
+        if not _has_audio_output():
+            self.skipTest("нет устройства вывода — цикл record→play невозможен")
         for i in range(2):
             self.c.record()
             _pump(1.5)
-            if self.c.state != AudioController.RECORDING:
-                self.skipTest(
-                    f"цикл {i + 1}: запись не стартовала: {self.c.status!r}"
-                )
+            self.assertEqual(
+                self.c.state,
+                AudioController.RECORDING,
+                f"цикл {i + 1}: запись не стартовала: {self.c.status!r}",
+            )
             self.c.stop_recording()
             _pump(1.0)
-            if self.c.state != AudioController.IDLE:
-                self.fail(
-                    f"цикл {i + 1}: stop_recording, "
-                    f"state={self.c.state} status={self.c.status!r}"
-                )
-            if not self.c.has_recording:
-                self.skipTest(f"цикл {i + 1}: запись пуста: {self.c.status!r}")
+            self.assertEqual(
+                self.c.state,
+                AudioController.IDLE,
+                f"цикл {i + 1}: после stop_recording, status={self.c.status!r}",
+            )
+            # Пустой файл после успешной записи — это дефект, не SKIP.
+            self.assertTrue(
+                self.c.has_recording,
+                f"цикл {i + 1}: файл записи пуст: {self.c.status!r}",
+            )
             self.c.play()
             _pump(0.5)
-            if self.c.state != AudioController.PLAYING:
-                self.skipTest(f"цикл {i + 1}: play не стартовал: {self.c.status!r}")
+            self.assertEqual(
+                self.c.state,
+                AudioController.PLAYING,
+                f"цикл {i + 1}: play не стартовал: {self.c.status!r}",
+            )
             self.c.stop_playback()
             _pump(0.5)
-            if self.c.state != AudioController.IDLE:
-                self.fail(f"цикл {i + 1}: stop_playback, state={self.c.state}")
+            self.assertEqual(
+                self.c.state,
+                AudioController.IDLE,
+                f"цикл {i + 1}: после stop_playback, status={self.c.status!r}",
+            )
+        # Путь до shutdown(): проверяем, что каталог реально удалён.
+        temp_dir = self.c._temp_dir
         self.c.shutdown()
         _pump(0.3)
-        self.assertIsNone(self.c._temp_dir)
+        self.assertFalse(
+            os.path.isdir(temp_dir or ""),
+            f"каталог записи не удалён: {temp_dir!r}",
+        )
