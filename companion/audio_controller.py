@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtMultimedia import (
@@ -70,6 +71,10 @@ class AudioController(QObject):
 
         # Флаг shutdown: после него контроллер не восстанавливается.
         self._shutdown = False
+
+        # Копии записей, сохранённые для диагностики: не удаляются
+        # при закрытии (остальные временные файлы — удаляются).
+        self._saved_files: set[str] = set()
 
     # --- Свойства для интерфейса ------------------------------------------
 
@@ -198,6 +203,38 @@ class AudioController(QObject):
             self.state = self.IDLE
             self.status = "Голос: готов"
             self.state_changed.emit()
+
+    def save_last_recording(self, dest_dir: str | None = None) -> str | None:
+        """Сохраняет копию последней завершённой записи для диагностики.
+
+        Копия уходит во внешнюю папку (по умолчанию — Рабочий стол) и НЕ
+        удаляется при закрытии окна; временный оригинал следует обычному
+        жизненному циклу. Возвращает путь к копии или ``None``, если записи
+        нет (включая случай после shutdown). Копирование безопасно и во
+        время распознавания: это отдельное чтение того же файла.
+        """
+        if self._shutdown or self._record_file is None or not self.has_recording:
+            self.status = "Сохранить нечего: нет завершённой записи."
+            self.state_changed.emit()
+            return None
+
+        src = self._record_file
+        dest_dir = os.path.abspath(dest_dir or os.path.expanduser("~/Desktop"))
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            ext = os.path.splitext(src)[1] or ".m4a"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = os.path.join(dest_dir, f"english-companion-{stamp}{ext}")
+            shutil.copy2(src, dest)
+        except OSError as exc:
+            self.status = f"Не удалось сохранить запись: {exc}"
+            self.state_changed.emit()
+            return None
+
+        self._saved_files.add(dest)
+        self.status = f"Запись сохранена: {dest}"
+        self.state_changed.emit()
+        return dest
 
     def _release_audio_output(self) -> None:
         """Явно отсоединяет QAudioOutput от QMediaPlayer и освобождает его.
@@ -366,8 +403,25 @@ class AudioController(QObject):
     def _cleanup_temp_dir(self) -> None:
         if self._temp_dir is None:
             return
+        # Сохранённые для диагностики копии не удаляем (на случай, если их
+        # попросили сохранить прямо во временную папку).
+        saved = {os.path.abspath(p) for p in self._saved_files}
         try:
-            shutil.rmtree(self._temp_dir)
+            if saved:
+                for name in os.listdir(self._temp_dir):
+                    p = os.path.join(self._temp_dir, name)
+                    if os.path.abspath(p) in saved:
+                        continue
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                try:
+                    os.rmdir(self._temp_dir)
+                except OSError:
+                    pass  # в папке осталась сохранённая копия — оставляем
+            else:
+                shutil.rmtree(self._temp_dir)
         except OSError as exc:
             # Ошибку не гасим молча: так папка могла быть занята системой.
             logger.warning(

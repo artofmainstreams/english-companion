@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         self.record_button = QPushButton("Записать")
         self.play_button = QPushButton("Прослушать")
         self.recognize_button = QPushButton("Распознать")
+        self.save_button = QPushButton("Сохранить")
         self.audio_status_label = QLabel("Голос: готов")
         self.stt_status_label = QLabel("Распознавание: готов")
 
@@ -74,6 +75,7 @@ class MainWindow(QMainWindow):
         self.record_button.clicked.connect(self.toggle_record)
         self.play_button.clicked.connect(self.toggle_play)
         self.recognize_button.clicked.connect(self.start_recognition)
+        self.save_button.clicked.connect(self.save_recording)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(self.message_input)
@@ -83,6 +85,7 @@ class MainWindow(QMainWindow):
         audio_layout.addWidget(self.record_button)
         audio_layout.addWidget(self.play_button)
         audio_layout.addWidget(self.recognize_button)
+        audio_layout.addWidget(self.save_button)
         audio_layout.addWidget(self.audio_status_label, 1)
         audio_layout.addWidget(self.stt_status_label)
 
@@ -152,6 +155,10 @@ class MainWindow(QMainWindow):
 
         self.play_button.setEnabled(audio.can_play or playing)
         self.play_button.setText("Стоп" if playing else "Прослушать")
+
+        # Сохранить доступна для завершённой записи; после shutdown
+        # has_recording становится False (путь сбрасывается).
+        self.save_button.setEnabled(audio.has_recording)
 
         self.audio_status_label.setText(audio.status)
         self._render_recognize_button()
@@ -246,6 +253,15 @@ class MainWindow(QMainWindow):
             self.audio.stop_playback()
         else:
             self.audio.play()
+
+    def save_recording(self) -> None:
+        """Сохраняет копию последней записи для диагностики (путь — в статусе)."""
+        dest = self.audio.save_last_recording()
+        if dest is not None:
+            self.status_label.setText(
+                "Запись сохранена для диагностики; при закрытии она не удалится."
+            )
+        # Если записи нет — статус контроллера уже объясняет причину.
 
     def closeEvent(self, event) -> None:  # noqa: N802 — имя из Qt
         # Если STT ещё работает — нельзя закрываться: файл читается, а

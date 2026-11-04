@@ -136,6 +136,72 @@ class TestControllerGuards(unittest.TestCase):
         self.assertFalse(self.c.can_play)
 
 
+class TestSaveRecording(unittest.TestCase):
+    """Сохранение последней записи для диагностики (без оборудования)."""
+
+    def setUp(self) -> None:
+        _app()
+        self.c = AudioController()
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-savetest-")
+        self.rec = os.path.join(self.tmp, "recording_1.m4a")
+        with open(self.rec, "wb") as f:
+            f.write(b"fake-audio-bytes")
+        # «Завершённая запись» (в тесте допустимо трогать приватные поля;
+        # окно и контроллер работают через публичный API).
+        self.c._temp_dir = self.tmp
+        self.c._record_file = self.rec
+        self.dest_dir = tempfile.mkdtemp(prefix="english-companion-saved-")
+
+    def tearDown(self) -> None:
+        self.c.shutdown()
+        _pump(0.1)
+        for d in (self.tmp, self.dest_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+        del self.c
+
+    def test_save_copies_recording_and_reports_path(self) -> None:
+        dest = self.c.save_last_recording(self.dest_dir)
+        self.assertIsNotNone(dest)
+        self.assertTrue(os.path.exists(dest))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"fake-audio-bytes")
+        # Оригинал во временной папке до закрытия не тронут.
+        self.assertTrue(os.path.exists(self.rec))
+        self.assertIn("Запись сохранена", self.c.status)
+
+    def test_saved_file_survives_shutdown(self) -> None:
+        """После сохранения копия переживает закрытие; временные файлы уходят."""
+        dest = self.c.save_last_recording(self.dest_dir)
+        self.assertIsNotNone(dest)
+        self.c.shutdown()
+        _pump(0.2)
+        self.assertTrue(
+            os.path.exists(dest),
+            f"сохранённая копия удалена при закрытии: {dest!r}",
+        )
+        self.assertFalse(os.path.isdir(self.tmp), "временная папка должна уйти")
+
+    def test_saved_inside_temp_dir_survives_shutdown(self) -> None:
+        """Даже копия внутри временной папки не удаляется при закрытии."""
+        dest = self.c.save_last_recording(self.tmp)
+        self.assertIsNotNone(dest)
+        self.c.shutdown()
+        _pump(0.2)
+        self.assertTrue(
+            os.path.exists(dest),
+            f"копия во временной папке удалена при закрытии: {dest!r}",
+        )
+
+    def test_save_without_recording_returns_none(self) -> None:
+        self.c._record_file = None
+        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
+
+    def test_save_rejected_after_shutdown(self) -> None:
+        self.c.shutdown()
+        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
+
+
 class TestAudioPlayback(unittest.TestCase):
     """Воспроизведение: реальный выход (сценарий на тихом WAV)."""
 
