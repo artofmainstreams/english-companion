@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 
 from .session_controller import SessionController
+from .message import Message
 
 
 class MainWindow(QMainWindow):
@@ -72,9 +73,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
         controller.state_changed.connect(self.render_state)
-        controller.message_added.connect(
-            lambda message: self.history.appendPlainText(f"You: {message}")
-        )
+        controller.message_added.connect(self.append_message)
         self.render_state()
 
     def render_state(self) -> None:
@@ -85,10 +84,14 @@ class MainWindow(QMainWindow):
             self.model_combo.setCurrentIndex(
                 self.model_combo.findText(controller.selected_model)
             )
-        self.model_combo.setEnabled(bool(controller.models) and not controller.loading)
-        self.refresh_button.setEnabled(not controller.loading)
+        self.model_combo.setEnabled(bool(controller.models) and not controller.busy)
+        self.refresh_button.setEnabled(not controller.busy)
         self.status_label.setText(controller.status)
         self.update_send_button()
+
+    def append_message(self, message: Message) -> None:
+        speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
+        self.history.appendPlainText(f"{speaker}: {message.content}\n")
 
     def select_model(self) -> None:
         self.controller.select_model(self.model_combo.currentText())

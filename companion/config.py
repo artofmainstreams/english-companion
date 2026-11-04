@@ -5,3 +5,4 @@ from dataclasses import dataclass
 class AppConfig:
     ollama_base_url: str = "http://127.0.0.1:11434"
     request_timeout_ms: int = 10_000
+    chat_timeout_ms: int = 180_000
