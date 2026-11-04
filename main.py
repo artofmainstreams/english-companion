@@ -1,16 +1,37 @@
-# This is a sample Python script.
+import sys
 
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMainWindow,
+    QVBoxLayout,
+    QWidget,
+)
 
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press ⌘F8 to toggle the breakpoint.
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.setWindowTitle("English Companion")
+        self.resize(900, 650)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("English Companion · Sprint 1"))
+        layout.addWidget(QLabel("Готов к работе"))
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+def main() -> int:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
