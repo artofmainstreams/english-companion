@@ -8,8 +8,26 @@ version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "PySide6>=6.8,<7",
-    # Локальное STT. Тяжёлые нативные зависимости (ctranslate2, onnxruntime,
-    # av) имеют arm64-колёса для macOS и Python 3.13.
+]
+
+# Бэкенды локального STT — отдельные опциональные группы, выбор в
+# companion/config.py (stt_backend). Автоматического fallback нет:
+#
+# * mlx — по умолчанию (macOS arm64; нужен системный ffmpeg):
+#     python -m pip install ".[mlx]"
+# * faster-whisper — альтернатива (в т.ч. другие платформы):
+#     python -m pip install ".[faster-whisper]"
+#
+# Установленная группа должна соответствовать выбранному stt_backend;
+# при несовпадении приложение выдаёт понятную ошибку.
+[project.optional-dependencies]
+mlx = [
+    # MLX — только Apple Silicon; на других платформах группа ставится
+    # пуста, а стt_backend="mlx" даёт явную ошибку с подсказкой.
+    "mlx>=0.32,<0.33 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-whisper>=0.4,<0.5 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+faster-whisper = [
     "faster-whisper>=1.2,<2",
     # PyAV 18+ убрали аргумент metadata_errors у av.open(), который
     # faster-whisper 1.2.1 по-прежнему передаёт (иначе decode_audio падает).

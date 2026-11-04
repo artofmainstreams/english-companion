@@ -1,7 +1,13 @@
 #!/usr/bin/env python
-"""Явно запускаемая проверка реального распознавания (faster-whisper).
+"""Явно запускаемая проверка реального распознавания.
 
 Отличается от обычных тестов: использует НАСТОЯЩУЮ модель, а не подмену.
+По умолчанию проверяется бэкенд из AppConfig — ``mlx``
+(mlx-community/whisper-large-v3-mlx; macOS arm64 + системный ffmpeg).
+Альтернативу можно выбрать явно:
+
+    .venv/bin/python real_stt_check.py --backend faster-whisper
+
 При первом запуске нужны интернет-веса (скачиваются и кэшируются), далее —
 полностью локально. Замеряет загрузку модели ОТДЕЛЬНО от повторного
 распознавания.
@@ -51,17 +57,32 @@ def main(argv: list[str]) -> int:
     from companion.config import AppConfig
     from companion.stt_engine import SttEngine
 
-    config = AppConfig()
+    # Опционально: --backend mlx|faster-whisper (иначе — дефолт AppConfig).
+    backend = None
+    if "--backend" in argv:
+        idx = argv.index("--backend")
+        if idx + 1 >= len(argv):
+            print("ОШИБКА: --backend требует значение (mlx | faster-whisper)")
+            return 2
+        backend = argv[idx + 1]
+        positional = [a for i, a in enumerate(argv) if i not in (idx, idx + 1)]
+    else:
+        positional = argv
+
+    config = AppConfig(stt_backend=backend) if backend else AppConfig()
     print(
         "STT настройки:",
-        f"model={config.stt_model} device={config.stt_device} "
-        f"compute_type={config.stt_compute_type} language={config.stt_language} "
-        f"task={config.stt_task} vad_filter={config.stt_vad_filter}",
+        f"backend={config.stt_backend} "
+        f"mlx_model={config.stt_mlx_model} "
+        f"whisper_model={config.stt_whisper_model} "
+        f"device={config.stt_device} compute_type={config.stt_compute_type} "
+        f"language={config.stt_language} task={config.stt_task} "
+        f"vad_filter={config.stt_vad_filter}",
     )
 
-    # Аудиофайл: аргумент или сгенерированный тон.
-    if len(argv) > 1:
-        audio_path = os.path.abspath(argv[1])
+    # Аудиофайл: аргумент или сгенерированный тон (argv[0] — имя скрипта).
+    if len(positional) > 1:
+        audio_path = os.path.abspath(positional[1])
         if not os.path.exists(audio_path):
             print(f"ОШИБКА: файл не найден: {audio_path}")
             return 2
