@@ -8,9 +8,12 @@
   * :class:`companion.audio_player.AudioPlayer` — воспроизведение любого
     готового аудиофайла; файл ему НЕ принадлежит, и плеер его никогда
     не удаляет (это же позволяет проигрывать TTS-файлы ответов);
-  * :class:`companion.tts_synth.TtsSynth` — озвучивание ответов
-    преподавателя (macOS ``say`` → временный AIFF); владелец своих
-    временных файлов; готовый файл публикует сигналом.
+  * синтезатор ответов — компонент с единым публичным API
+    (``synthesize``/``shutdown``, сигналы ``state_changed``/
+    ``reply_ready``/``failed``, владелец своих временных файлов):
+    :class:`companion.tts_synth.TtsSynth` (macOS ``say`` → AIFF) или
+    :class:`companion.tts_qwen3.Qwen3TtsSynth` (Qwen3-TTS, MLX → WAV);
+    какой — решает ``build_tts(config)`` по ``AppConfig.tts_engine``.
 
 ``AudioController`` — фасад с прежним публичным API плюс действия
 озвучивания (``speak_reply``/``replay_reply``):
@@ -24,9 +27,13 @@
   * автозапуск готового ответа согласован с записью и воспроизведением:
     если аудио занято, ответ сохраняется для ручного «Повторить ответ»;
   * порядок ``shutdown()``: сначала плеер останавливается и отпускает
-    файл и выход (файл при этом НЕ удаляется), потом синтез останавливает
-    процесс ``say``, потом рекордер разбирает сессию; каждый компонент
-    удаляет СВОИ временные файлы.
+    файл и выход (файл при этом НЕ удаляется), потом синтез
+    останавливается и удаляет СВОИ временные файлы, потом рекордер
+    разбирает сессию; каждый компонент удаляет СВОИ временные файлы.
+
+Фасад НЕ знает механизм синтеза (процесс ``say`` или фоновый поток
+модели) — только публичный API синтезатора, поэтому смена движка
+(``tts_engine``) не затрагивает остальной код.
 """
 
 import os
@@ -35,7 +42,41 @@ from PySide6.QtCore import QObject, Signal
 
 from .audio_player import AudioPlayer
 from .audio_recorder import AudioRecorder
+from .config import AppConfig
+from .tts_qwen3 import Qwen3TtsSynth
 from .tts_synth import DEFAULT_VOICE, TtsSynth
+
+
+def build_tts(config: AppConfig, parent: QObject | None = None) -> QObject:
+    """Выбирает движок озвучивания по конфигу (``tts_engine``).
+
+    ``"say"`` (по умолчанию) — :class:`companion.tts_synth.TtsSynth`;
+    ``"qwen3"`` — :class:`companion.tts_qwen3.Qwen3TtsSynth` (mlx_audio
+    импортируется лениво, в рабочем потоке первого синтеза). Оба — с
+    одинаковым публичным API: состояния, ``synthesize``/``shutdown``,
+    сигналы ``state_changed``/``reply_ready``/``failed``. Неизвестный
+    движок — явная ошибка (без тихой замены), как с STT-бэкендами.
+    """
+    engine = (config.tts_engine or "say").strip().lower()
+    if engine == "say":
+        return TtsSynth(config.tts_voice, parent)
+    if engine == "qwen3":
+        method = (config.tts_qwen3_method or "voice_design").strip().lower()
+        if method == "reference":
+            model_id = config.tts_qwen3_model_reference
+        else:
+            model_id = config.tts_qwen3_model_voice_design
+        return Qwen3TtsSynth(
+            model_id=model_id,
+            instruct=config.tts_qwen3_instruct,
+            ref_audio=config.tts_qwen3_ref_audio,
+            ref_text=config.tts_qwen3_ref_text,
+            parent=parent,
+        )
+    raise ValueError(
+        f"неизвестный tts_engine: {config.tts_engine!r} "
+        "(допустимо: 'say' или 'qwen3')"
+    )
 
 
 class AudioController(QObject):
@@ -53,14 +94,18 @@ class AudioController(QObject):
     * ``replay_reply()`` проигрывает последний готовый ответ БЕЗ нового
       запроса к Ollama и без нового синтеза.
 
+    Движок синтеза: готовый компонент с публичным API ``TtsSynth``
+    (``tts=...``, например из ``build_tts(config)``) или по умолчанию
+    ``TtsSynth(tts_voice)``; фасад не зависит от механизма синтеза.
+
     Жизненный цикл:
     * ``shutdown()`` идемпотентна — повторные вызовы безопасны;
     * после ``shutdown()`` ``record()``/``play()``/``speak_reply()``/
       ``replay_reply()`` отклоняются, а поздние сигналы Qt игнорируются
       (состояние больше не «оживает»);
     * разбор по порядку: остановка плеера → выход → остановка синтеза
-      (процесс ``say``) → разбор сессии записи; каждый компонент удаляет
-      СВОИ временные файлы.
+      (процесс ``say`` / фоновый поток модели) → разбор сессии записи;
+      каждый компонент удаляет СВОИ временные файлы.
     """
 
     state_changed = Signal()
@@ -76,13 +121,20 @@ class AudioController(QObject):
         self,
         tts_voice: str = DEFAULT_VOICE,
         parent: QObject | None = None,
+        tts: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.status = "Голос: готов"
 
         self.player = AudioPlayer(self)
         self.recorder = AudioRecorder(self)
-        self.tts = TtsSynth(tts_voice, self)
+        # Синтезатор: переданный компонент (build_tts/config.tts_engine)
+        # или TtsSynth по умолчанию; родителя задаёт фасад.
+        if tts is None:
+            tts = TtsSynth(tts_voice, self)
+        else:
+            tts.setParent(self)
+        self.tts = tts
 
         # Статус и состояние синхронизируются из компонента, который
         # последний раз подал state_changed.
@@ -252,9 +304,9 @@ class AudioController(QObject):
 
         Порядок важен: сначала плеер останавливается и отпускает файл/выход
         (файл он НЕ удаляет — владелец файла это делает), потом синтез
-        останавливает процесс ``say`` (он мог писать файл) и удаляет СВОИ
-        временные файлы, потом рекордер разбирает сессию и удаляет СВОИ
-        временные файлы.
+        останавливается (процесс ``say`` или фоновый поток модели — он мог
+        писать файл) и удаляет СВОИ временные файлы, потом рекордер
+        разбирает сессию и удаляет СВОИ временные файлы.
         """
         if self._shutdown:
             return
@@ -264,8 +316,9 @@ class AudioController(QObject):
         #    Переданный ранее файл при этом НЕ удаляется.
         self.player.shutdown()
 
-        # 2) Синтез: остановка процесса say (до удаления временных файлов!),
-        #    затем удаление его СВОИХ временных файлов.
+        # 2) Синтез: остановка (процесс say / фоновый поток модели —
+        #    до удаления временных файлов!), затем удаление его СВОИХ
+        #    временных файлов.
         self.tts.shutdown()
 
         # 3) Рекордер: отключение hotplug, разбор графа, временные файлы.
