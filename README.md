@@ -187,7 +187,7 @@ MLX-путь (по умолчанию) покрыт отдельным набо�
 .venv/bin/python tools/mlx_stt_compare.py /путь/recording_1.m4a
 ```
 
-## Подбор голоса TTS: Kokoro-82M (MLX)
+## Подбор голоса TTS: Kokoro-82M и Qwen3-TTS VoiceDesign (MLX)
 
 Эксперимент для выбора голоса преподавателя (британское произношение,
 молодой женский тембр). Пока выбор не сделан, TTS приложения НЕ меняется:
@@ -234,4 +234,28 @@ espeak-ng 1.52.0 (Homebrew). Примечания: `misaki` не деклари�
 Британская фонетизация в установленной версии задаётся
 `KokoroPipeline(lang_code="b")` (алиас `en-gb`), G2P — misaki с
 `british=True`.
+
+### Qwen3-TTS-12Hz-1.7B-VoiceDesign (мягкий британский голос)
+
+Сравнение с любимым Kokoro-голосом `bf_emma`: два описания голоса
+(варианты A и B, «мягкий/светлый южнобританский женский тембр») на тех
+же четырёх репликах. Реплики генерируются отдельно (по одной на вызов
+`generate_voice_design`), чтобы проверить сохранение тембра и акцента
+между ответами; на вариант — один WAV с паузами.
+
+```bash
+# то же экспериментальное окружение, что Kokoro; доп. пакеты не нужны
+# (модуль qwen3_tts входит в mlx-audio):
+<env>/bin/python tools/qwen3_voice_design_samples.py --out ~/Desktop/kokoro-voices
+
+# свои описания/фразы:
+<env>/bin/python tools/qwen3_voice_design_samples.py \
+    --instruct-a "..." --instruct-b "..." "Фраза 1." "Фраза 2."
+```
+
+Модель: **mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16**
+(Hugging Face; bf16, 24 kHz; веса в кэше `~/.cache/huggingface`,
+~4.2 GiB, вне репозитория; первый запуск скачивает). Образцы
+`qwen3_vd_A.wav` / `qwen3_vd_B.wav` пишутся рядом с `bf_emma.wav`
+(по умолчанию `~/Desktop/kokoro-voices`) — вне Git.
 
