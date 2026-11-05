@@ -248,9 +248,11 @@ espeak-ng 1.52.0 (Homebrew). Примечания: `misaki` не деклари�
 # (модуль qwen3_tts входит в mlx-audio):
 <env>/bin/python tools/qwen3_voice_design_samples.py --out ~/Desktop/kokoro-voices
 
-# свои описания/фразы:
+# свои описания/фразы (имена выходных файлов — --prefix,
+# чтобы не затереть уже готовые образцы):
 <env>/bin/python tools/qwen3_voice_design_samples.py \
-    --instruct-a "..." --instruct-b "..." "Фраза 1." "Фраза 2."
+    --instruct-a "..." --instruct-b "..." --prefix qwen3_vd_v2 \
+    "Фраза 1." "Фраза 2."
 ```
 
 Модель: **mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16**

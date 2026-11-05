@@ -16,7 +16,9 @@ mlx-audio):
 
 Отчёт на stdout: загрузка модели (отдельно), синтез каждой реплики,
 итог по варианту. Описания голосов можно переопределить флагами
---instruct-a / --instruct-b; фразы — позиционными аргументами.
+--instruct-a / --instruct-b; фразы — позиционными аргументами;
+имена выходных файлов — --prefix (по умолчанию qwen3_vd →
+qwen3_vd_A.wav / qwen3_vd_B.wav).
 
 Модель: mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16 (Hugging Face;
 веса в кэше ~/.cache/huggingface, вне репозитория). Приложение при этом
@@ -117,6 +119,9 @@ def main() -> int:
                     help="описание голоса, вариант A")
     ap.add_argument("--instruct-b", default=DEFAULT_INSTRUCT_B,
                     help="описание голоса, вариант B")
+    ap.add_argument("--prefix", default="qwen3_vd",
+                    help="префикс имён выходных файлов: <prefix>_A.wav, <prefix>_B.wav "
+                         "(по умолчанию: %(default)s)")
     ap.add_argument("--model", default=DEFAULT_REPO_ID,
                     help="идентификатор модели (по умолчанию: %(default)s)")
     ap.add_argument("--out", type=Path, default=Path("~/Desktop/kokoro-voices").expanduser(),
@@ -136,8 +141,10 @@ def main() -> int:
     sample_rate = int(model.sample_rate)
     log(f"sample rate: {sample_rate} Hz; пауза между репликами: {PAUSE_SECONDS} c")
 
-    synth_variant(model, sample_rate, "A", args.instruct_a, phrases, out_dir / "qwen3_vd_A.wav")
-    synth_variant(model, sample_rate, "B", args.instruct_b, phrases, out_dir / "qwen3_vd_B.wav")
+    synth_variant(model, sample_rate, "A", args.instruct_a, phrases,
+                  out_dir / f"{args.prefix}_A.wav")
+    synth_variant(model, sample_rate, "B", args.instruct_b, phrases,
+                  out_dir / f"{args.prefix}_B.wav")
 
     log(f"готово: {out_dir}")
     return 0
