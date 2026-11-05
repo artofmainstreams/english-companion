@@ -34,7 +34,7 @@ faulthandler.enable()
 # offscreen — чтобы тесты не зависели от дисплея; аудио при этом работает.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QTimer, QUrl
 from PySide6.QtMultimedia import QMediaDevices, QMediaRecorder
 from PySide6.QtWidgets import QApplication
 
@@ -396,6 +396,85 @@ class TestRecordingError(unittest.TestCase):
         self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
         self.assertTrue(self.c.has_recording, "успешная запись не готова")
         self.assertIn("Запись готова", self.c.status)
+
+
+class TestWarmupCancellation(unittest.TestCase):
+    """Подтверждённый дефект: ошибка/Stop/shutdown обязаны отменять
+    незавершённый lead-in (таймер прогрева + pending-URL), а поздний
+    callback ``_on_warmup_done`` не должен запускать запись поверх
+    остановки/ошибки/новой записи.
+
+    Проверяется без оборудования: имитируем «идущий lead-in» (pending-URL
+    + запущенный таймер) и убеждаемся, что каждый путь отмены гасит его.
+    """
+
+    def setUp(self) -> None:
+        _app()
+        self.c = AudioController()
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-warmtest-")
+        self.rec = os.path.join(self.tmp, "recording_1.m4a")
+        with open(self.rec, "wb") as f:
+            f.write(b"rec-bytes")
+        self.c._temp_dir = self.tmp
+        self.c._record_file = self.rec
+
+    def tearDown(self) -> None:
+        self.c.shutdown()
+        _pump(0.1)
+        if os.path.isdir(self.tmp):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        del self.c
+
+    def _begin_lead_in(self) -> None:
+        """Имитация идущего lead-in: pending-URL + запущенный (долгий) таймер."""
+        self.c._pending_real_url = QUrl.fromLocalFile(self.rec)
+        self.c._output_warmed = False
+        self.c.state = self.c.PLAYING
+        self.c._warmup_timer = QTimer()
+        self.c._warmup_timer.setSingleShot(True)
+        self.c._warmup_timer.timeout.connect(self.c._on_warmup_done)
+        # Долгий срок: за время теста сам не сработает, только через отмену.
+        self.c._warmup_timer.start(5000)
+
+    def test_player_error_cancels_warmup(self) -> None:
+        """Ошибка плеера во время lead-in отменяет прогрев; callback мёртв."""
+        self._begin_lead_in()
+        self.c._player_fail("test error")
+        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
+        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertIn("Ошибка воспроизведения", self.c.status)
+        # Старый callback не должен «пробудить» запись.
+        self.c._on_warmup_done()
+        self.assertFalse(
+            self.c._output_warmed, "старый callback запустил воспроизведение"
+        )
+        self.assertEqual(self.c.state, AudioController.IDLE)
+
+    def test_stop_playback_cancels_warmup(self) -> None:
+        """«Остановить» во время lead-in отменяет прогрев и pending."""
+        self._begin_lead_in()
+        self.c.stop_playback()
+        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
+        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.c._on_warmup_done()
+        self.assertFalse(
+            self.c._output_warmed, "старый callback запустил воспроизведение"
+        )
+        self.assertEqual(self.c.state, AudioController.IDLE)
+
+    def test_shutdown_cancels_warmup(self) -> None:
+        """shutdown отменяет lead-in; callback после shutdown мёртв."""
+        self._begin_lead_in()
+        self.c.shutdown()
+        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
+        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
+        self.c._on_warmup_done()
+        self.assertFalse(
+            self.c._output_warmed, "старый callback запустил воспроизведение"
+        )
+        self.assertEqual(self.c.state, AudioController.IDLE)
 
 
 class TestAudioPlayback(unittest.TestCase):

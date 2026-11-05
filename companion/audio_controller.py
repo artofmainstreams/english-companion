@@ -60,6 +60,9 @@ class AudioController(QObject):
         self.state = self.IDLE
         self.status = "Голос: готов"
 
+        # Базовая точка времени для диагностических событий (элипсис в мс).
+        self._t0 = time.monotonic()
+
         self._format = self._pick_format()
         self._temp_dir: str | None = None
         self._record_file: str | None = None
@@ -291,6 +294,7 @@ class AudioController(QObject):
     def stop_recording(self) -> None:
         if self._shutdown or self.state != self.RECORDING or self._recorder is None:
             return
+        self._log_event("record:stop-requested")
         self._recorder.stop()
 
     def play(self) -> None:
@@ -317,6 +321,12 @@ class AudioController(QObject):
         self._audio_output = QAudioOutput(device)
         self._audio_output.setVolume(1.0)
         self._player.setAudioOutput(self._audio_output)
+        self._log_event(
+            "play:start",
+            output=device.description(),
+            warmed=self._output_warmed,
+            source=os.path.basename(self._record_file),
+        )
 
         real_url = QUrl.fromLocalFile(self._record_file)
         if self._output_warmed:
@@ -353,10 +363,8 @@ class AudioController(QObject):
             return
         # Отменяем возможный незавершённый lead-in, чтобы он потом не
         # «пробудил» воспроизведение, которое мы останавливаем.
-        if self._warmup_timer is not None:
-            self._warmup_timer.stop()
-            self._warmup_timer = None
-        self._pending_real_url = None
+        self._cancel_warmup()
+        self._log_event("play:stop")
         self._player.stop()
         if self.state == self.PLAYING:
             self.state = self.IDLE
@@ -367,6 +375,7 @@ class AudioController(QObject):
         """Запускает реальную запись (для тёплого выхода и после lead-in)."""
         self._output_warmed = True
         self._pending_real_url = None
+        self._log_event("play:real-start", source=os.path.basename(url.toLocalFile()))
         self.state = self.PLAYING
         self.status = "Воспроизведение…"
         self.state_changed.emit()
@@ -377,7 +386,34 @@ class AudioController(QObject):
         """Lead-in завершён: выход прогрет — запускаем запись."""
         if self._shutdown or self._pending_real_url is None:
             return
+        self._log_event("warmup:handoff")
         self._start_real_playback(self._pending_real_url)
+
+    def _cancel_warmup(self) -> None:
+        """Отменяет незавершённый lead-in: останавливает таймер и сбрасывает
+        pending-URL, чтобы поздний callback не запустил запись поверх
+        остановки/ошибки/новой записи. Идемпотентна.
+        """
+        if self._warmup_timer is not None:
+            self._warmup_timer.stop()
+            self._warmup_timer = None
+        if self._pending_real_url is not None:
+            self._pending_real_url = None
+            self._log_event("warmup:cancel")
+
+    def _log_event(self, name: str, **kv) -> None:
+        """Диагностическое событие с элипсисом (мс от старта контроллера).
+
+        Помогает восстановить таймлайн «завершение записи → освобождение
+        входа → выбор выхода → смена source → mediaStatus → playbackState →
+        ошибки». Включается уровнем logging (INFO).
+        """
+        try:
+            elapsed_ms = int((time.monotonic() - self._t0) * 1000)
+        except (AttributeError, ValueError):
+            elapsed_ms = -1
+        extra = " ".join(f"{k}={v}" for k, v in kv.items())
+        logger.info("[audio] %sms %s%s", elapsed_ms, name, (" " + extra) if extra else "")
 
     def _make_warmup_silence(self) -> str | None:
         """Короткий файл тишины для прогрева (Bluetooth) вывода.
@@ -478,10 +514,7 @@ class AudioController(QObject):
         self._shutdown = True
 
         # Незавершённый lead-in не должен сработать после разбора.
-        if self._warmup_timer is not None:
-            self._warmup_timer.stop()
-            self._warmup_timer = None
-        self._pending_real_url = None
+        self._cancel_warmup()
 
         # 0) Снимаем обработчик hotplug-сигнала и отпускаем экземпляр
         #    QMediaDevices, чтобы поздние события не доходили до мёртвого
@@ -527,6 +560,7 @@ class AudioController(QObject):
         # Поздний сигнал после shutdown не должен «оживлять» состояние.
         if self._shutdown:
             return
+        self._log_event("recorderState", state=str(state))
         if state == QMediaRecorder.RecorderState.RecordingState:
             self.state = self.RECORDING
             self.status = "Записываю… (нажми «Остановить»)"
@@ -600,6 +634,11 @@ class AudioController(QObject):
     def _on_player_playing_changed(self, playing: bool) -> None:
         if self._shutdown:
             return
+        self._log_event(
+            "playbackState",
+            playing=playing,
+            position_ms=(self._player.position() if self._player is not None else -1),
+        )
         if self._pending_real_url is not None:
             # Идёт lead-in (тишина), а не запись: состояние ведёт
             # _on_warmup_done, здесь не трогаем.
@@ -615,12 +654,14 @@ class AudioController(QObject):
     def _on_player_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         if self._shutdown:
             return
+        self._log_event("mediaStatus", status=str(status))
         if status == QMediaPlayer.MediaStatus.InvalidMedia:
             self._player_fail("не удалось открыть файл записи")
 
     def _on_player_error(self, error: QMediaPlayer.Error, message: str) -> None:
         if error == QMediaPlayer.Error.NoError or self._shutdown:
             return
+        self._log_event("player_error", error=str(error), message=message)
         self._player_fail(message or error.name)
 
     # --- Вспомогательные ---------------------------------------------------
@@ -644,10 +685,14 @@ class AudioController(QObject):
         # Флаг сессии завершён (успешно или со сбоем): следующая запись
         # стартует с чистого состояния.
         self._session_failed = False
+        self._log_event("record:finalized", ready=self.has_recording)
         self._teardown_recording()
         self.state_changed.emit()
 
     def _player_fail(self, message: str) -> None:
+        # Ошибка воспроизведения отменяет незавершённый lead-in, чтобы
+        # поздний callback не запустил запись поверх ошибки/новой записи.
+        self._cancel_warmup()
         if self.state == self.PLAYING:
             self.state = self.IDLE
             self.status = "Ошибка воспроизведения: " + message
@@ -658,6 +703,8 @@ class AudioController(QObject):
         recorder = self._recorder
         session = self._session
         audio_input = self._audio_input
+        if audio_input is not None:
+            self._log_event("record:input-release")
         self._recorder = None
         self._session = None
         self._audio_input = None
