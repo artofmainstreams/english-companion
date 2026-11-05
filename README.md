@@ -340,6 +340,29 @@ brew install rubberband   # движок, если ещё не установл�
 `qwen3_D_ref_new.wav`, `qwen3_D_ref_phrase.wav`, `qwen3_low_D.wav`).
 Веса и WAV — вне Git.
 
+Следующий шаг: в `qwen3_D_vd_p4.wav` (длинная реплика voice_design)
+нравятся произношение, голос и тембр — она взята как референс
+Base-режима. Точный текст реплики (из `DEFAULT_PHRASES` скрипта,
+«That was a really good answer. You explained your idea, gave an
+example, and kept your rhythm natural.») передан как `ref_text`
+и проверен расшифровкой (faster-whisper large-v3: все 18 слов
+совпадают, нет обрывов — речь 0.05–7.20 c, естественная тишина на хвосте):
+
+```bash
+<env>/bin/python tools/qwen3_voice_consistency_check.py --method reference \
+    --ref-audio ~/Desktop/qwen-voice-low-register/qwen3_D_vd_p4.wav \
+    --ref-text "That was a really good answer. You explained your idea, " \
+               "gave an example, and kept your rhythm natural." \
+    --prefix qwen3_p4_ref
+```
+
+Результат — `qwen3_p4_ref_new.wav` + `qwen3_p4_ref_p1…p4.wav`
+(рядом — p4-референс и прежняя `qwen3_D_ref_new.wav` для сравнения).
+Загрузка модели 3.43 c; синтез 3.67–6.05 c на реплику (17.15 c на 4).
+F0_median 195.1 Hz (прежний референс — 212.4; p4 — 206.9);
+log-mel расстояние к p4: 0.84 против 4.47 у прежней сборки.
+Решение — на слух.
+
 ### Интеграция Qwen3-TTS в приложение (подготовлена, по умолчанию выключена)
 
 `companion/tts_qwen3.py` — озвучивание ответов Qwen3-TTS (MLX) с тем же

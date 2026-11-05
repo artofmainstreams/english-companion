@@ -200,12 +200,15 @@ def main() -> int:
                     help="точный текст референса (по умолчанию: %(default)s)")
     ap.add_argument("--skip-copy", action="store_true",
                     help="не копировать выбранный образец D и реплику-референс")
+    ap.add_argument("--prefix", default="qwen3_D_ref",
+                    help="префикс выходных файлов: <prefix>_p1…pN.wav, "
+                         "<prefix>_new.wav (по умолчанию: %(default)s)")
     args = ap.parse_args()
 
     phrases = args.phrases or DEFAULT_PHRASES
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = "qwen3_D_vd" if args.method == "voice_design" else "qwen3_D_ref"
+    prefix = args.prefix
 
     repo = REPO_VOICE_DESIGN if args.method == "voice_design" else REPO_BASE
     if args.method == "reference" and not args.ref_audio.is_file():
