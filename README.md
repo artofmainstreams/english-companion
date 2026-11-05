@@ -261,6 +261,23 @@ espeak-ng 1.52.0 (Homebrew). Примечания: `misaki` не деклари�
 `qwen3_vd_A.wav` / `qwen3_vd_B.wav` пишутся рядом с `bf_emma.wav`
 (по умолчанию `~/Desktop/kokoro-voices`) — вне Git.
 
+### Низкий «бархатный» регистр (четыре варианта A–D)
+
+`tools/qwen3_low_register_samples.py` — четыре голоса: одно общее
+описание (мягкое, тёплое, бархатное звучание, южнобританский акцент,
+«терпеливый преподаватель») + у каждого своё описание регистра.
+Реплики — отдельно (по одной на вызов), на вариант один WAV с паузами
+0.6 c; громкость партии выровнена по RMS; высота — как у модели
+(без постобработки):
+
+```bash
+<env>/bin/python tools/qwen3_low_register_samples.py \
+    --out ~/Desktop/qwen-voice-low-register
+```
+
+Исходный Qwen-образец (`qwen3_vd_A.wav`) копируется рядом для
+сравнения (`--reference`, `--skip-reference`).
+
 ### Понижение высоты готовых образцов (Rubber Band)
 
 `tools/pitch_shift_voices.py` — для каждого готового WAV версии:
