@@ -11,8 +11,8 @@
   S2 — «сразу после записи» (запись → стоп → сразу play). Точная реплика
        сценария пользователя.
 
-Позиция плеера сэмплируется каждые ~25 мс. Логгер контроллера (INFO)
-выдаёт дискретные события: record:stop-requested, record:finalized,
+Позиция плеера сэмплируется каждые ~25 мс. Логгеры аудиослоя (INFO)
+выдают дискретные события: record:stop-requested, record:finalized,
 record:teardown, play:start, play:stop, mediaStatus, playbackState,
 player_error.
 
@@ -77,13 +77,17 @@ class PositionSampler:
     def __init__(self, controller: AudioController, period_ms: int = 25) -> None:
         self.c = controller
         self.samples: list[tuple[int, int]] = []
-        self.t0 = controller._t0  # та же база, что у _log_event
+        self.t0 = controller.player._t0  # та же база, что у _log_event плеера
         self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
         self._period = period_ms
 
     def _tick(self) -> None:
-        p = self.c._player.position() if self.c._player is not None else -1
+        p = (
+            self.c.player._player.position()
+            if self.c.player._player is not None
+            else -1
+        )
         self.samples.append((int((time.monotonic() - self.t0) * 1000), p))
 
     def start(self) -> None:
@@ -116,10 +120,10 @@ def scenario(label: str, capture_first: bool) -> None:
     tmp = tempfile.mkdtemp(prefix="headdiag-")
     rec = os.path.join(tmp, "rec.wav")
     make_recording(rec)
-    c._temp_dir = tmp
-    c._record_file = rec
+    c.recorder._temp_dir = tmp
+    c.recorder._record_file = rec
     # С1: играем «готовую» запись (без предшествующей записи).
-    c._ready_recording = rec
+    c.recorder._ready_recording = rec
 
     sampler = PositionSampler(c)
 
@@ -138,7 +142,11 @@ def scenario(label: str, capture_first: bool) -> None:
     sampler.stop()
     c.stop_playback()
     pump(0.3)
-    playback = c._player.playbackState() if c._player is not None else "N/A"
+    playback = (
+        c.player._player.playbackState()
+        if c.player._player is not None
+        else "N/A"
+    )
     print(f"  итог: state={c.state} playbackState={playback} has_recording={c.has_recording}")
     summarize(sampler.samples)
 

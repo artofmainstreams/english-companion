@@ -35,6 +35,7 @@ from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from companion.audio_controller import AudioController  # noqa: E402
+from companion.audio_recorder import AudioRecorder  # noqa: E402
 from companion.config import AppConfig  # noqa: E402
 from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
@@ -94,9 +95,9 @@ class SttWindowTestBase(unittest.TestCase):
         # Задаём «завершённую запись» (в тесте допустимо; окно берёт путь
         # через публичный last_recording_path). Готовой является именно
         # ``_ready_recording``; ``_record_file`` — тот же файл текущей сессии.
-        self.audio._temp_dir = self.tmp
-        self.audio._record_file = self.audio_path
-        self.audio._ready_recording = self.audio_path
+        self.audio.recorder._temp_dir = self.tmp
+        self.audio.recorder._record_file = self.audio_path
+        self.audio.recorder._ready_recording = self.audio_path
 
         self.backend = FakeBackend(result_text="hello there", delay=0.2)
         self.stt = SttEngine(self.backend)
@@ -311,8 +312,8 @@ class TestMicCombo(unittest.TestCase):
             self.skipTest("нет устройств ввода — выбрать нечего")
         self.assertTrue(self.audio.set_input_device(pairs[0][0]), self.audio.status)
         # «Отключение»: id уже не существует, приходит hotplug.
-        self.audio._selected_input_id = "b'gone-mic:input'"
-        self.audio._on_input_devices_changed()
+        self.audio.recorder._selected_input_id = "b'gone-mic:input'"
+        self.audio.recorder._on_input_devices_changed()
         _pump(0.05)
         self.assertIsNone(self.audio.selected_input_id())
         self.assertEqual(
@@ -323,12 +324,12 @@ class TestMicCombo(unittest.TestCase):
 
     def test_combo_disabled_while_recording(self) -> None:
         self.assertTrue(self.w.mic_combo.isEnabled())
-        self.audio.state = self.audio.RECORDING
+        self.audio.recorder.state = AudioRecorder.RECORDING
         self.w.render_audio()
         self.assertFalse(
             self.w.mic_combo.isEnabled(), "переключение запрещено в записи"
         )
-        self.audio.state = self.audio.IDLE
+        self.audio.recorder.state = AudioRecorder.IDLE
         self.w.render_audio()
         self.assertTrue(self.w.mic_combo.isEnabled())
 
