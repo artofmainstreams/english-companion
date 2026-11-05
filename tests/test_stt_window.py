@@ -241,5 +241,95 @@ class TestCloseHandling(SttWindowTestBase):
         self.assertFalse(os.path.exists(self.audio_path))
 
 
+class TestMicCombo(unittest.TestCase):
+    """Комбо микрофонов: itemData — стабильный id устройства,
+    отображение — название; выбор согласован с AudioController."""
+
+    def setUp(self) -> None:
+        _app()
+        self.config = AppConfig()
+        self.audio = AudioController()
+        controller = SessionController(OllamaClient(self.config))
+        self.stt = FakeSttEngine(self.config, result_text="x")
+        self.w = MainWindow(controller, self.audio, self.stt)
+        self.w.show()
+        _pump(0.1)
+
+    def tearDown(self) -> None:
+        self.stt.shutdown()
+        self.audio.shutdown()
+        _pump(0.1)
+        del self.w
+
+    def test_item0_system_and_items_carry_device_ids(self) -> None:
+        self.assertEqual(
+            self.w.mic_combo.itemText(0), "Системный (по умолчанию)"
+        )
+        self.assertIsNone(self.w.mic_combo.itemData(0))
+        pairs = self.audio.input_devices()
+        self.assertEqual(self.w.mic_combo.count(), 1 + len(pairs))
+        for i, (dev_id, name) in enumerate(pairs, start=1):
+            self.assertEqual(
+                self.w.mic_combo.itemData(i), dev_id, "itemData не id"
+            )
+            self.assertEqual(self.w.mic_combo.itemText(i), name)
+
+    def test_selection_roundtrip_via_item_data(self) -> None:
+        pairs = self.audio.input_devices()
+        if not pairs:
+            self.skipTest("нет устройств ввода — выбрать нечего")
+        dev_id, name = pairs[0]
+        self.w.mic_combo.setCurrentIndex(1)  # сигнал → контроллер
+        _pump(0.05)
+        self.assertEqual(self.audio.selected_input_id(), dev_id)
+        self.assertEqual(self.audio.selected_input_name(), name)
+        # Позиция 0 → None (системное устройство).
+        self.w.mic_combo.setCurrentIndex(0)
+        _pump(0.05)
+        self.assertIsNone(self.audio.selected_input_id())
+
+    def test_refresh_preserves_selection_by_id(self) -> None:
+        """Перестроение списка (hotplug) не теряет выбранный микрофон."""
+        pairs = self.audio.input_devices()
+        if not pairs:
+            self.skipTest("нет устройств ввода — выбрать нечего")
+        dev_id, _name = pairs[0]
+        self.assertTrue(self.audio.set_input_device(dev_id), self.audio.status)
+        self.w._refresh_mic_combo()
+        self.assertEqual(
+            self.w.mic_combo.findData(dev_id),
+            self.w.mic_combo.currentIndex(),
+            "выбор по id потерян при перестроении",
+        )
+
+    def test_hotplug_resets_selection_and_ui(self) -> None:
+        """Микрофон отключили: контроллер сбросил выбор, UI — на «Системный»."""
+        pairs = self.audio.input_devices()
+        if not pairs:
+            self.skipTest("нет устройств ввода — выбрать нечего")
+        self.assertTrue(self.audio.set_input_device(pairs[0][0]), self.audio.status)
+        # «Отключение»: id уже не существует, приходит hotplug.
+        self.audio._selected_input_id = "b'gone-mic:input'"
+        self.audio._on_input_devices_changed()
+        _pump(0.05)
+        self.assertIsNone(self.audio.selected_input_id())
+        self.assertEqual(
+            self.w.mic_combo.currentIndex(),
+            0,
+            "UI не согласован с контроллером после отключения микрофона",
+        )
+
+    def test_combo_disabled_while_recording(self) -> None:
+        self.assertTrue(self.w.mic_combo.isEnabled())
+        self.audio.state = self.audio.RECORDING
+        self.w.render_audio()
+        self.assertFalse(
+            self.w.mic_combo.isEnabled(), "переключение запрещено в записи"
+        )
+        self.audio.state = self.audio.IDLE
+        self.w.render_audio()
+        self.assertTrue(self.w.mic_combo.isEnabled())
+
+
 if __name__ == "__main__":
     unittest.main()

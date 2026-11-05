@@ -232,21 +232,25 @@ class TestInputDeviceSelection(unittest.TestCase):
             "без выбора должен разрешаться системный микрофон",
         )
 
-    def test_select_and_clear_valid_device(self) -> None:
-        """Выбор по названию фиксируется; ``None`` возвращает системный."""
-        names = self.c.input_device_names()
-        if not names:
+    def test_select_by_id_and_name(self) -> None:
+        """Выбор работает и по id (путь UI), и по названию; ``None`` — системный."""
+        pairs = self.c.input_devices()
+        if not pairs:
             self.skipTest("нет устройств ввода — выбрать нечего")
-        name = names[0]
-        self.assertTrue(self.c.set_input_device(name), self.c.status)
+        dev_id, name = pairs[0]
+        self.assertTrue(self.c.set_input_device(dev_id), self.c.status)
+        self.assertEqual(self.c.selected_input_id(), dev_id)
         self.assertEqual(self.c.selected_input_name(), name)
-        self.assertIn(name, self.c.status)
         # Разрешение: устройство с тем же идентификатором, что выбрано.
         device = self.c._selected_input_device()
         self.assertEqual(self.c._device_id(device), self.c._selected_input_id)
 
+        # Совместимость: выбор по названию даёт тот же результат.
+        self.assertTrue(self.c.set_input_device(name), self.c.status)
+        self.assertEqual(self.c.selected_input_id(), dev_id)
+
         self.assertTrue(self.c.set_input_device(None), self.c.status)
-        self.assertIsNone(self.c.selected_input_name())
+        self.assertIsNone(self.c.selected_input_id())
         self.assertIn("системный", self.c.status)
 
     def test_unknown_device_rejected(self) -> None:
@@ -302,6 +306,96 @@ class TestInputDeviceSelection(unittest.TestCase):
         self.c.devices_changed.connect(lambda: changed.append(1))
         self.c._on_input_devices_changed()
         self.assertEqual(changed, [])
+
+    def test_hotplug_during_recording_resets_selection_for_next(self) -> None:
+        """Отключение во время записи: выбор для следующей записи сброшен,
+        UI получил devices_changed (комбо перестроится с «Системный»)."""
+        changed: list[int] = []
+        self.c.devices_changed.connect(lambda: changed.append(1))
+        self.c._selected_input_id = "b'gone-mic:input'"
+        self.c.state = self.c.RECORDING
+        try:
+            self.c._on_input_devices_changed()
+            self.assertIsNone(self.c._selected_input_id)
+            self.assertEqual(changed, [1])
+        finally:
+            self.c.state = self.c.IDLE
+
+
+class TestRecordingError(unittest.TestCase):
+    """Сбой сессии записи (например, отключение микрофона во время записи):
+    частичный файл не считается готовой записью — в любом порядке событий.
+    """
+
+    def setUp(self) -> None:
+        _app()
+        self.c = AudioController()
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-errtest-")
+        self.rec = os.path.join(self.tmp, "recording_1.m4a")
+        with open(self.rec, "wb") as f:
+            f.write(b"partial-bytes")
+        # «Идёт запись» с фактическим файлом (без реального захвата).
+        self.c._temp_dir = self.tmp
+        self.c._record_file = self.rec
+        self.c.state = self.c.RECORDING
+
+    def tearDown(self) -> None:
+        self.c.shutdown()
+        _pump(0.1)
+        if os.path.isdir(self.tmp):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        del self.c
+
+    def _device_error(self) -> None:
+        # В этой сборке нет Error.DeviceError — потеря устройства
+        # приходит как ResourceError.
+        self.c._on_recorder_error(
+            QMediaRecorder.Error.ResourceError, "device lost"
+        )
+
+    def test_error_during_recording_invalidates_file(self) -> None:
+        """Ошибка до Stopped: файл не помечается готовым, есть понятный статус."""
+        self._device_error()
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertFalse(
+            self.c.has_recording, "частичный файл помечен готовым"
+        )
+        self.assertIn("Ошибка записи", self.c.status)
+        # Поздний Stopped не «оживляет» запись.
+        self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertFalse(self.c.has_recording)
+        self.assertIn("Ошибка записи", self.c.status)
+
+    def test_error_after_stop_invalidates_partial_file(self) -> None:
+        """Ошибка после Stopped: «готовность» частичного файла отменяется."""
+        # Сначала «нормальная» остановка (файл существует) → выглядит готовым…
+        self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertTrue(self.c.has_recording)
+        # …потом приходит ошибка сессии: готовность отменяется.
+        self._device_error()
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertFalse(
+            self.c.has_recording, "частичный файл остался помечен готовым"
+        )
+        self.assertIn("Ошибка записи", self.c.status)
+
+    def test_next_recording_after_failure_is_ready(self) -> None:
+        """Флаг сбоя не переносится на следующую (успешную) запись."""
+        self._device_error()
+        self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
+        self.assertFalse(self.c._session_failed, "флаг сбоя не сброшен")
+
+        # Следующая запись: новый файл, та же последовательность без ошибки.
+        rec2 = os.path.join(self.tmp, "recording_2.m4a")
+        with open(rec2, "wb") as f:
+            f.write(b"good-bytes")
+        self.c._record_file = rec2
+        self.c.state = self.c.RECORDING
+        self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
+        self.assertTrue(self.c.has_recording, "успешная запись не готова")
+        self.assertIn("Запись готова", self.c.status)
 
 
 class TestAudioPlayback(unittest.TestCase):

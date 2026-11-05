@@ -193,29 +193,30 @@ class MainWindow(QMainWindow):
     def _refresh_mic_combo(self) -> None:
         """Перечитывает список микрофонов, сохраняя текущий выбор.
 
-        Вызывается при старте окна и при каждом изменении списка
-        (подключение/отключение устройства). Сигналы комбо на время
-        перестроения блокированы, чтобы «сброс» индекса не сбивал выбор.
+        В ``itemData`` храним стабильный ``QAudioDevice.id()``: названия
+        (description) могут совпадать у разных устройств, по id — нет.
+        Позиция 0 — системное устройство, его ``itemData`` равно ``None``.
+        Сигналы комбо на время перестроения блокированы, чтобы «сброс»
+        индекса не сбивал текущий выбор.
         """
         audio = self.audio
-        selected = audio.selected_input_name()
-        items = ["Системный (по умолчанию)"] + audio.input_device_names()
+        selected_id = audio.selected_input_id()
         with QSignalBlocker(self.mic_combo):
             self.mic_combo.clear()
-            self.mic_combo.addItems(items)
-            self.mic_combo.setCurrentIndex(
-                max(self.mic_combo.findText(selected), 0)
-                if selected is not None
-                else 0
-            )
+            self.mic_combo.addItem("Системный (по умолчанию)", None)
+            for device_id, name in audio.input_devices():
+                self.mic_combo.addItem(name, device_id)
+            if selected_id is not None:
+                self.mic_combo.setCurrentIndex(
+                    max(self.mic_combo.findData(selected_id), 0)
+                )
+            else:
+                self.mic_combo.setCurrentIndex(0)
         self.render_audio()  # статус контроллера + состояние кнопок
 
     def _on_mic_changed(self) -> None:
-        """Позиция 0 — системное устройство; дальше — конкретный микрофон."""
-        if self.mic_combo.currentIndex() <= 0:
-            self.audio.set_input_device(None)
-        else:
-            self.audio.set_input_device(self.mic_combo.currentText())
+        """Передаём контроллеру ``itemData``: ``None`` — системное устройство."""
+        self.audio.set_input_device(self.mic_combo.currentData())
 
     def _on_stt_state_changed(self) -> None:
         self.stt_status_label.setText(self.stt.status)
