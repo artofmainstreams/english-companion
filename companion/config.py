@@ -19,12 +19,20 @@ class AppConfig:
     stt_mlx_model: str = "mlx-community/whisper-large-v3-mlx"
 
     # faster-whisper-бэкенд (CTranslate2).
-    stt_whisper_model: str = "base.en"
+    # MULTILINGUAL модель (base), а не base.en: при автоматическом определении
+    # языка (stt_language=None) модель должна уметь и русский, и английский.
+    # .en-варианты — только английский: они ломают «русский остаётся русским».
+    stt_whisper_model: str = "base"
     stt_device: str = "cpu"
     stt_compute_type: str = "int8"
 
     # Общие параметры распознавания.
-    stt_language: str = "en"
+    # stt_language: язык речи. По умолчанию None — Whisper определяет язык
+    # САМ (по первому окну записи): русская речь -> русский текст,
+    # английская -> английский. Язык можно зафиксировать явно ("en", "ru"),
+    # но тогда речь на другом языке распознаётся «в лоб», без перевода.
+    stt_language: str | None = None
+    # transcribe — расшифровать речь как есть; НЕ translate (перевод).
     stt_task: str = "transcribe"
     # Только для faster-whisper (у MLX этого параметра нет).
     stt_vad_filter: bool = True

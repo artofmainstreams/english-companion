@@ -87,9 +87,15 @@ class MlxBackend:
     def transcribe(self, model: Any, audio_path: str) -> str:
         """Распознаёт файл через mlx-whisper (в рабочем потоке).
 
-        ``language``/``task`` берутся из AppConfig; текста за рамками самой
-        Whisper-модели никаких исправлений не делается. Аудио декодируется
-        системным ffmpeg (mlx-whisper вызывает его подпроцессом).
+        ``language``/``task`` передаются в библиотеку АС-ЕСТЬ из AppConfig
+        и НЕ заменяются адаптером:
+          * ``language=None`` (дефолт) — mlx-whisper определяет язык сам
+            (первое окно записи): русский -> русский текст, английский ->
+            английский. Явная "en"/"ru" фиксирует язык;
+          * ``task`` — по умолчанию "transcribe" (расшифровка, не перевод).
+        Текста за рамками самой Whisper-модели никаких исправлений не
+        делается (нет LLM-перевода/правки). Аудио декодируется системным
+        ffmpeg (mlx-whisper вызывает его подпроцессом).
         """
         import mlx_whisper
 
@@ -120,7 +126,15 @@ class FasterWhisperBackend:
         )
 
     def transcribe(self, model: Any, audio_path: str) -> str:
-        """Распознаёт файл faster-whisper. Выполняется в рабочем потоке."""
+        """Распознаёт файл faster-whisper. Выполняется в рабочем потоке.
+
+        Параметры передаются АС-ЕСТЬ из AppConfig:
+          * ``language=None`` (дефолт) — faster-whisper определяет язык сам:
+            русский -> русский текст, английский -> английский. Явная
+            "en"/"ru" фиксирует язык (модель при этом должна быть
+            мультиязычной — base, а не base.en);
+          * ``task`` — по умолчанию "transcribe" (расшифровка, не перевод).
+        """
         segments, _info = model.transcribe(
             audio_path,
             language=self.config.stt_language,
