@@ -186,3 +186,52 @@ MLX-путь (по умолчанию) покрыт отдельным набо�
 ```bash
 .venv/bin/python tools/mlx_stt_compare.py /путь/recording_1.m4a
 ```
+
+## Подбор голоса TTS: Kokoro-82M (MLX)
+
+Эксперимент для выбора голоса преподавателя (британское произношение,
+молодой женский тембр). Пока выбор не сделан, TTS приложения НЕ меняется:
+ответы озвучивает macOS `say` с `Samantha` (`companion/tts_synth.py`,
+`AppConfig.tts_voice`).
+
+`tools/kokoro_voice_samples.py` генерирует по одному WAV на голос
+(по умолчанию 4 учебные фразы, одинаковый темп `--speed 1.0`, пауза
+0.6 c между репликами) и, с `--with-say`, образец `say` на тех же фразах.
+Образцы пишутся в `--out` (по умолчанию `~/Desktop/kokoro-voices`) —
+ВНЕ репозитория и не попадают в Git; как и веса модели.
+
+Эксперимент работает в отдельном временном окружении, НЕ в .venv
+проекта (рабочее окружение Python 3.13 проекта не меняется):
+
+```bash
+# окружение (уже создано при проверке; путь можно заменить на любой):
+python3.13 -m venv /private/var/folders/hn/d7dw50jn3pb250mptnv1hmjc0000gn/T/opencode/kokoro-exp/venv
+
+# зависимости эксперимента:
+<env>/bin/pip install mlx-audio misaki num2words spacy phonemizer soundfile
+<env>/bin/python -m spacy download en_core_web_sm
+brew install espeak-ng          # библиотека, которую требует phonemizer
+
+# образцы по умолчанию + Samantha для сравнения:
+<env>/bin/python tools/kokoro_voice_samples.py --with-say --out ~/Desktop/kokoro-voices
+
+# свои фразы:
+<env>/bin/python tools/kokoro_voice_samples.py --with-say "Фраза 1." "Фраза 2."
+```
+
+Зависимости эксперимента (Python 3.13, arm64): mlx-audio 0.6.4,
+mlx 0.32.4, misaki 0.7.4, num2words 0.5.14, spacy 3.8.18
+(+ модель `en_core_web_sm` 3.8.0), phonemizer 3.6.0, soundfile 0.14.0,
+espeak-ng 1.52.0 (Homebrew). Примечания: `misaki` не декларирует
+`num2words`/`spacy` как зависимости (без них `misaki.en` не импортируется);
+`misaki.espeak` требует `phonemizer` и библиотеку espeak-ng; `soundfile`
+нужен для чтения AIFF, который пишет `say` (`aifc` удалён в Python 3.13).
+
+Модель: **mlx-community/Kokoro-82M-bf16** (Hugging Face; веса в кэше
+`~/.cache/huggingface`, ~312 MiB bf16 + voice-pack'и, вне репозитория;
+первый запуск скачивает). На Hub репозитория `mlx-community/Kokoro-82M`
+больше нет (401 Repository Not Found) — рабочий MLX-порт это `Kokoro-82M-bf16`.
+Британская фонетизация в установленной версии задаётся
+`KokoroPipeline(lang_code="b")` (алиас `en-gb`), G2P — misaki с
+`british=True`.
+

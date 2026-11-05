@@ -23,7 +23,7 @@ Ollama работает на Windows и доступна через SSH-тунн
 | `companion/stt_engine.py` | Оркестрация STT: фоновый поток, сигналы, ленивая загрузка модели, shutdown |
 | `companion/stt_backends.py` | `SttBackend` (Protocol): MlxBackend, FasterWhisperBackend, `build_backend` |
 | `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language=None`, `task=transcribe`), голос озвучивания `tts_voice` |
-| `tests/` · `tools/` · `real_stt_check.py` | Тесты (unittest); диагностика и явная проверка реального распознавания |
+| `tests/` · `tools/` · `real_stt_check.py` | Тесты (unittest); диагностика и явная проверка реального распознавания; подбор TTS-голоса: Kokoro-82M (MLX, отдельное окружение) + образец macOS `say` |
 
 ## Инварианты
 
