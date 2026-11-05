@@ -91,9 +91,11 @@ class SttWindowTestBase(unittest.TestCase):
         controller = SessionController(client)
         self.audio = AudioController()
         # Задаём «завершённую запись» (в тесте допустимо; окно берёт путь
-        # через публичный last_recording_path).
+        # через публичный last_recording_path). Готовой является именно
+        # ``_ready_recording``; ``_record_file`` — тот же файл текущей сессии.
         self.audio._temp_dir = self.tmp
         self.audio._record_file = self.audio_path
+        self.audio._ready_recording = self.audio_path
 
         self.stt = FakeSttEngine(
             self.config, result_text="hello there", delay=0.2

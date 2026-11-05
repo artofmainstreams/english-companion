@@ -147,9 +147,11 @@ class TestSaveRecording(unittest.TestCase):
         with open(self.rec, "wb") as f:
             f.write(b"fake-audio-bytes")
         # «Завершённая запись» (в тесте допустимо трогать приватные поля;
-        # окно и контроллер работают через публичный API).
+        # окно и контроллер работают через публичный API). Готовой является
+        # именно ``_ready_recording`` — «пишущийся» файл сюда не попадает.
         self.c._temp_dir = self.tmp
         self.c._record_file = self.rec
+        self.c._ready_recording = self.rec
         self.dest_dir = tempfile.mkdtemp(prefix="english-companion-saved-")
 
     def tearDown(self) -> None:
@@ -182,19 +184,41 @@ class TestSaveRecording(unittest.TestCase):
         )
         self.assertFalse(os.path.isdir(self.tmp), "временная папка должна уйти")
 
-    def test_saved_inside_temp_dir_survives_shutdown(self) -> None:
-        """Даже копия внутри временной папки не удаляется при закрытии."""
-        dest = self.c.save_last_recording(self.tmp)
-        self.assertIsNotNone(dest)
-        self.c.shutdown()
-        _pump(0.2)
-        self.assertTrue(
-            os.path.exists(dest),
-            f"копия во временной папке удалена при закрытии: {dest!r}",
-        )
+    def test_save_into_temp_dir_rejected(self) -> None:
+        """Экспорт ВНУТРЬ управляемого временного каталога запрещён (регрессия)."""
+        self.assertIsNone(self.c.save_last_recording(self.tmp))
+        self.assertIn("временного", self.c.status)
+        # Копию внутрь не создали: в каталоге остался только оригинал.
+        self.assertEqual(len(os.listdir(self.tmp)), 1)
+
+    def test_save_into_temp_subdir_rejected(self) -> None:
+        """Вложенная папка внутри временного каталога — тоже отказ."""
+        sub = os.path.join(self.tmp, "nested", "out")
+        self.assertIsNone(self.c.save_last_recording(sub))
+        self.assertIn("временного", self.c.status)
+
+    def test_save_into_symlinked_temp_dir_rejected(self) -> None:
+        """Симссылка, ведущая во временный каталог, разрешается — отказ."""
+        link = os.path.join(self.dest_dir, "link-into-tmp")
+        os.symlink(self.tmp, link)
+        try:
+            self.assertIsNone(self.c.save_last_recording(link))
+            self.assertIn("временного", self.c.status)
+        finally:
+            if os.path.islink(link):
+                os.unlink(link)
+
+    def test_save_does_not_overwrite_existing(self) -> None:
+        """Не перезаписываем существующий файл: выбираем свободное имя."""
+        first = self.c.save_last_recording(self.dest_dir)
+        second = self.c.save_last_recording(self.dest_dir)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second, "перезаписали существующий файл")
+        self.assertTrue(os.path.exists(first), "первый файл затёрт вторым")
 
     def test_save_without_recording_returns_none(self) -> None:
-        self.c._record_file = None
+        self.c._ready_recording = None
         self.assertIsNone(self.c.save_last_recording(self.dest_dir))
 
     def test_save_rejected_after_shutdown(self) -> None:
@@ -398,6 +422,57 @@ class TestRecordingError(unittest.TestCase):
         self.assertIn("Запись готова", self.c.status)
 
 
+class TestRecordingReadiness(unittest.TestCase):
+    """Готовность записи (регрессия дефекта 1): «пишущийся» файл не считается
+    готовым; готовым запись становится только после подтверждения завершения
+    рекордером; при ошибке частичная запись не публикуется как готовая.
+    """
+
+    def setUp(self) -> None:
+        _app()
+        self.c = AudioController()
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-readiness-")
+        self.rec = os.path.join(self.tmp, "recording_1.m4a")
+        with open(self.rec, "wb") as f:
+            f.write(b"being-written-bytes")  # непустой файл «в записи»
+        # Идёт запись: текущий файл непустой, готовой ещё нет.
+        self.c._temp_dir = self.tmp
+        self.c._record_file = self.rec
+        self.c._ready_recording = None
+        self.c.state = self.c.RECORDING
+        self.dest_dir = tempfile.mkdtemp(prefix="english-companion-readdest-")
+
+    def tearDown(self) -> None:
+        self.c.shutdown()
+        _pump(0.1)
+        for d in (self.tmp, self.dest_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+        del self.c
+
+    def test_in_progress_file_not_ready(self) -> None:
+        """Пока идёт запись, непустой файл НЕ готов (save/play/STT недоступны)."""
+        self.assertFalse(self.c.has_recording, "файл в записи помечен готовым")
+        self.assertIsNone(self.c.last_recording_path)
+        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
+
+    def test_finalized_success_becomes_ready(self) -> None:
+        """После подтверждения завершения (Stopped) запись становится готовой."""
+        self.c._on_recorder_state(QMediaRecorder.RecorderState.StoppedState)
+        self.assertTrue(self.c.has_recording, "успешная запись не готова")
+        self.assertEqual(self.c.last_recording_path, self.rec)
+        self.assertEqual(self.c._ready_recording, self.rec)
+
+    def test_finalized_failure_not_ready(self) -> None:
+        """Ошибка записи: частичный файл не публикуется как готовый."""
+        self.c._on_recorder_error(
+            QMediaRecorder.Error.ResourceError, "device lost"
+        )
+        self.assertFalse(self.c.has_recording, "частичный файл готов")
+        self.assertIsNone(self.c.last_recording_path)
+        self.assertIsNone(self.c._ready_recording)
+
+
 class _FakePlayer:
     """Заглушка QMediaPlayer: фиксирует вызовы play/stop и состояние,
     без аудиооборудования. Позволяет проверить, что «Остановить» и ошибка
@@ -456,6 +531,7 @@ class TestPlaybackLifecycle(unittest.TestCase):
             f.write(b"rec-bytes")
         self.c._temp_dir = self.tmp
         self.c._record_file = self.rec
+        self.c._ready_recording = self.rec
         self.player = _FakePlayer()
         self.c._player = self.player
 
@@ -544,6 +620,7 @@ class TestAudioPlayback(unittest.TestCase):
         _make_silent_wav(self.wav)
         self.c._temp_dir = self.tmp
         self.c._record_file = self.wav
+        self.c._ready_recording = self.wav
         # Старт сценария. Если он не запускается, тест сам сообщит FAIL
         # (устройство же проверено в setUpClass) — а не пропустится.
         self.c.play()

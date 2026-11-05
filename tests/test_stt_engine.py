@@ -143,3 +143,74 @@ class TestSttEngineLifecycle(unittest.TestCase):
         _pump(0.1)
         self.assertFalse(stt.is_busy)
         self.assertFalse(stt.model_loaded, "после shutdown модель не грузится")
+
+
+class TestSyncGuard(unittest.TestCase):
+    """Общая защита sync/async (регрессия дефекта 3): после ``shutdown`` и
+    во время работы новые работы отклоняются; исключение не оставляет движок
+    «занятым»; блокировка состояния свободна на время тяжёлых вызовов.
+    """
+
+    def setUp(self) -> None:
+        _app()
+        self.config = AppConfig()
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-sync-")
+        self.audio_path = os.path.join(self.tmp, "clip.wav")
+        _make_audio(self.audio_path)
+
+    def tearDown(self) -> None:
+        import shutil
+
+        if os.path.isdir(self.tmp):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sync_rejected_after_shutdown(self) -> None:
+        """recognize_sync после shutdown отклоняется (было: работало)."""
+        stt = FakeSttEngine(self.config, result_text="hi")
+        stt.shutdown()
+        with self.assertRaises(RuntimeError):
+            stt.recognize_sync(self.audio_path)
+        self.assertFalse(stt.is_busy)
+        self.assertFalse(stt.model_loaded, "после shutdown модель не грузится")
+
+    def test_sync_rejected_while_async_busy(self) -> None:
+        """recognize_sync во время асинхронной работы отклоняется
+        (было: шла параллельно, обходя ограничение «одно в работе»)."""
+        stt = FakeSttEngine(self.config, result_text="hi", delay=0.6)
+        stt.recognize(self.audio_path)  # асинхронная работа идёт
+        self.assertTrue(stt.is_busy, "после recognize движок должен быть занят")
+        with self.assertRaises(RuntimeError):
+            stt.recognize_sync(self.audio_path)
+        stt.shutdown()
+        self.assertFalse(stt.is_busy)
+        self.assertEqual(
+            stt._fake_model.transcribe_calls, 1, "стартовала вторая работа"
+        )
+
+    def test_sync_error_does_not_leave_busy(self) -> None:
+        """Сбой sync не «заклинивает» движок: следующая работа проходит claim."""
+        stt = FakeSttEngine(
+            self.config, raise_on_transcribe=RuntimeError("whisper-boom")
+        )
+        with self.assertRaises(RuntimeError):
+            stt.recognize_sync(self.audio_path)
+        self.assertFalse(stt.is_busy, "исключение оставило движок занятым")
+        # Следующий вызов не отклоняется по «занятости»: ошибается уже
+        # распознавание, а не guard.
+        with self.assertRaises(RuntimeError) as ctx:
+            stt.recognize_sync(self.audio_path)
+        self.assertNotIn("занят", str(ctx.exception), "движок застрял «занятым»")
+        self.assertIn("whisper-boom", str(ctx.exception))
+
+    def test_state_lock_free_during_heavy_work(self) -> None:
+        """Блокировка состояния свободна, пока идёт работа (не удерживается
+        на время тяжёлых вызовов — загрузка модели и распознавание)."""
+        stt = FakeSttEngine(self.config, result_text="hi", delay=0.8)
+        stt.recognize(self.audio_path)  # асинхронная работа (задержка 0.8s)
+        _pump(0.05)  # даём потоку дойти до тяжёлого вызова
+        self.assertTrue(stt.is_busy)
+        acquired = stt._state_lock.acquire(timeout=0.1)
+        self.assertTrue(acquired, "блокировка удерживается на время работы")
+        stt._state_lock.release()
+        stt.shutdown()
+        self.assertFalse(stt.is_busy)

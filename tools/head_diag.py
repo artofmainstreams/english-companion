@@ -118,6 +118,8 @@ def scenario(label: str, capture_first: bool) -> None:
     make_recording(rec)
     c._temp_dir = tmp
     c._record_file = rec
+    # С1: играем «готовую» запись (без предшествующей записи).
+    c._ready_recording = rec
 
     sampler = PositionSampler(c)
 

@@ -57,6 +57,14 @@ class SttEngine(QObject):
         self._state_lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._shutdown = False
+        # Общий «работает» затвор для sync/async: не больше одного
+        # распознавания одновременно, независимо от пути. ``_inflight`` —
+        # сколько работ в работе (0/1); ``_inflight_done`` — сброшен, пока
+        # работа идёт, и устанавливается при её завершении, чтобы shutdown
+        # мог чисто дождаться её (без busy-wait и terminate).
+        self._inflight = 0
+        self._inflight_done = threading.Event()
+        self._inflight_done.set()
 
     # --- Публичный API ------------------------------------------------------
 
@@ -73,12 +81,11 @@ class SttEngine(QObject):
     def recognize(self, audio_path: str | None) -> None:
         """Запускает распознавание файла в фоновом потоке.
 
-        Вызов ожидается из UI-потока. Повторный запуск во время работы
-        игнорируется (кнопка в окне тоже заблокирована). Путь передаётся из
-        окна как публичный результат ``AudioController.last_recording_path``.
+        Вызов ожидается из UI-потока. Повторный запуск во время работы и
+        после ``shutdown`` отклоняются (кнопка в окне тоже заблокирована).
+        Путь передаётся из окна как публичный результат
+        ``AudioController.last_recording_path``.
         """
-        if self.is_busy:
-            return
         if audio_path is None or not os.path.exists(audio_path):
             self.failed.emit("Файл аудио недоступен для распознавания.")
             return
@@ -92,36 +99,49 @@ class SttEngine(QObject):
     def recognize_sync(self, audio_path: str) -> str:
         """Синхронное распознавание — для проверок без цикла событий.
 
-        Использует ту же логику (ленивая загрузка модели + распознавание), но
-        выполняется в вызывающем потоке.
+        Та же общая защита, что у асинхронного пути: после ``shutdown`` и
+        во время другой работы отклоняется (``RuntimeError``); исключение из
+        распознавания пробрасывается, но не оставляет движок «занятым».
+        Выполняется в вызывающем потоке.
         """
-        return self._do_recognize(audio_path)
+        if audio_path is None or not os.path.exists(audio_path):
+            raise RuntimeError("Файл аудио недоступен для распознавания.")
+        if not self._claim():
+            raise RuntimeError(
+                "Распознавание недоступно: движок занят или остановлен."
+            )
+        release_status = "Распознавание: готов"
+        try:
+            return self._do_recognize(audio_path)
+        except Exception:
+            release_status = "Ошибка распознавания"
+            raise
+        finally:
+            # И в успехе, и в сбое — отпускаем «работает» затвор, чтобы
+            # движок не остался занятым.
+            self._release(release_status)
 
     def shutdown(self) -> None:
-        """Останавливает приём новых работ и дожидается рабочего потока.
+        """Останавливает приём новых работ и дожидается уже начатых.
 
-        Вычисление не прерывается намеренно: рабочий поток завершается сам
-        (и лишь после этого файл можно удалять). Идемпотентна; безопасна из
-        UI-потока и из ``aboutToQuit``.
+        Вычисление не прерывается намеренно (без ``terminate``): начатая работа
+        завершается сама (и лишь после этого файл можно удалять), а ``shutdown``
+        чисто дожидается её через ``_inflight_done`` (не busy-wait). Учитывает
+        обе ветки — асинхронный поток и синхронный вызов в другом потоке.
+        Идемпотентна; безопасна из UI-потока и из ``aboutToQuit``.
 
         Отзывчивость закрытия обеспечивает окно: пока распознавание идёт,
         ``closeEvent`` откладывает закрытие (``event.ignore``), и ``shutdown``
-        вызывается только после завершения работы — блокирующий join в этот
-        момент тривиален и UI не блокирует.
+        вызывается после завершения работы.
         """
         with self._state_lock:
             if self._shutdown:
                 return
             self._shutdown = True
 
-        worker = self._worker
-        if (
-            worker is not None
-            and worker is not threading.current_thread()
-            and worker.is_alive()
-        ):
-            # Дожидаемся завершения: после этого файл больше не читается.
-            worker.join()
+        # Дожидаемся завершения уже начатых работ (sync/async). Если работ
+        # нет — событие уже установлено и wait() возвращается сразу.
+        self._inflight_done.wait()
         self._worker = None
 
         with self._state_lock:
@@ -132,10 +152,19 @@ class SttEngine(QObject):
     # --- Внутренняя оркестрация --------------------------------------------
 
     def _claim(self) -> bool:
-        """Атомарно захватывает «занято». False — уже работаем или завершаем."""
+        """Атомарно захватывает единственную «работает» ячейку (sync/async).
+
+        Возвращает ``False``, если движок остановлен, уже идёт работа или
+        состояние уже не ``IDLE``. При успехе устанавливает состояние
+        ``LOADING``, помечает работу в работе и сбрасывает ``_inflight_done``.
+        Блокировку состояния держит только на время этого обновления — тяжёлые
+        вызовы (загрузка модели, распознавание) выполняются вне её.
+        """
         with self._state_lock:
             if self._shutdown or self.state != self.IDLE:
                 return False
+            self._inflight += 1
+            self._inflight_done.clear()
             self.state = self.LOADING
             self.status = "Загружаю модель распознавания…"
         # Сообщаем UI немедленно: кнопки блокируются, даже пока не стартовал
@@ -143,22 +172,44 @@ class SttEngine(QObject):
         self.state_changed.emit()
         return True
 
+    def _release(self, status: str = "Распознавание: готов") -> None:
+        """Отпускает «работает» ячейку и возвращает состояние ``IDLE``.
+
+        Идемпотентна: повторный вызов не уводит счётчик ниже нуля и не
+        сбрасывает ``_inflight_done`` повторно.
+        """
+        with self._state_lock:
+            if self._inflight > 0:
+                self._inflight -= 1
+            if self._inflight == 0:
+                self._inflight_done.set()
+            self.state = self.IDLE
+            self.status = status
+        self.state_changed.emit()
+
     def _run(self, audio_path: str) -> None:
         """Тело рабочего потока: загрузка модели + распознавание."""
         try:
-            model = self._ensure_model()
-            self._set_state(self.TRANSCRIBING, "Распознаю речь…")
-            text = self._run_transcribe(model, audio_path).strip()
+            text = self._do_recognize(audio_path)
             self.recognized.emit(text)
-            self._set_state(self.IDLE, "Распознавание: готов")
+            self._release("Распознавание: готов")
         except Exception as exc:  # noqa: BLE001 — сообщаем любую причину в UI
             logger.exception("Распознавание не удалось")
-            self._set_state(self.IDLE, "Ошибка распознавания")
+            # Порядок важен: сначала отпускаем затвор (state_changed обновила
+            # UI), затем failed — её сообщение становится ПОСЛЕДНИМ текстом
+            # статусной строки окна (окно пишет status при state_changed).
+            self._release("Ошибка распознавания")
             self.failed.emit(f"Не удалось распознать речь: {exc}")
 
     def _do_recognize(self, audio_path: str) -> str:
+        """Загрузка модели + распознавание. Вызывается ПОСЛЕ успешного ``_claim``.
+
+        Тяжёлые вызовы выполняются БЕЗ удержания ``_state_lock`` (блокировка
+        состояния захватывается только короткими обновлениями состояния).
+        """
         model = self._ensure_model()
-        return self._run_transcribe(model, audio_path)
+        self._set_state(self.TRANSCRIBING, "Распознаю речь…")
+        return self._run_transcribe(model, audio_path).strip()
 
     def _ensure_model(self):
         """Возвращает модель, загрузив её лениво (один раз)."""

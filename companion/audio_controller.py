@@ -62,6 +62,11 @@ class AudioController(QObject):
         # источник по URL: если записывать поверх того же пути, setSource()
         # вернёт уже декодированную (старую) запись, а не перечитает файл.
         self._record_seq = 0
+        # Готовая (успешно завершённая) запись — то, что можно слушать,
+        # сохранять и передавать STT. Отличается от ``_record_file``: то —
+        # текущий файл, который ещё может писаться (готовым НЕ считается);
+        # это — последняя запись, подтверждённая завершением рекордером.
+        self._ready_recording: str | None = None
 
         # Сбой текущей сессии записи (errorOccurred): частичный файл
         # после такого не считается готовой записью — независимо от того,
@@ -99,19 +104,21 @@ class AudioController(QObject):
         # Флаг shutdown: после него контроллер не восстанавливается.
         self._shutdown = False
 
-        # Копии записей, сохранённые для диагностики: не удаляются
-        # при закрытии (остальные временные файлы — удаляются).
-        self._saved_files: set[str] = set()
-
     # --- Свойства для интерфейса ------------------------------------------
+
+    @staticmethod
+    def _valid_recording_file(path: str | None) -> bool:
+        """Файл существует и непустой — пригоден как «готовая запись»."""
+        return (
+            path is not None
+            and os.path.exists(path)
+            and os.path.getsize(path) > 0
+        )
 
     @property
     def has_recording(self) -> bool:
-        return (
-            self._record_file is not None
-            and os.path.exists(self._record_file)
-            and os.path.getsize(self._record_file) > 0
-        )
+        """Есть ли успешно завершённая запись (не «пишущийся» файл)."""
+        return self._valid_recording_file(self._ready_recording)
 
     @property
     def can_record(self) -> bool:
@@ -136,14 +143,15 @@ class AudioController(QObject):
 
     @property
     def last_recording_path(self) -> str | None:
-        """Публичный доступ к пути последней завершённой записи.
+        """Публичный доступ к пути последней УСПЕШНО ЗАВЕРШЁННОЙ записи.
 
-        Возвращает путь к файлу, если запись существует и непуста, иначе
-        ``None``. Из окна берётся путь именно через это свойство, а не через
-        приватные поля контроллера.
+        Возвращает путь к файлу, если запись готова (существует и непуста),
+        иначе ``None``. «Пишущийся» файл текущей сессии здесь не отдаётся —
+        его нельзя сохранять, слушать или передавать STT как готовый. Из окна
+        и STT берётся путь именно через это свойство, а не через приватные поля.
         """
-        if self.has_recording and self._record_file is not None:
-            return self._record_file
+        if self.has_recording and self._ready_recording is not None:
+            return self._ready_recording
         return None
 
     def input_devices(self) -> list[tuple[str, str]]:
@@ -258,6 +266,10 @@ class AudioController(QObject):
         )
         url = QUrl.fromLocalFile(self._record_file)
         self._session_failed = False
+        # Новая запись сменяет предыдущую «готовую»: текущий файл ещё не
+        # готов (станет им только после подтверждения завершения рекордером),
+        # поэтому до финализации ничего не публикуется как готовое.
+        self._ready_recording = None
 
         self._audio_input = QAudioInput(device)
         self._recorder = QMediaRecorder()
@@ -290,6 +302,7 @@ class AudioController(QObject):
             self.status = "Сначала запиши речь."
             self.state_changed.emit()
             return
+        src = self._ready_recording
 
         device = QMediaDevices.defaultAudioOutput()
         if device.isNull():
@@ -308,10 +321,10 @@ class AudioController(QObject):
         self._log_event(
             "play:start",
             output=device.description(),
-            source=os.path.basename(self._record_file),
+            source=os.path.basename(src),
         )
 
-        self._player.setSource(QUrl.fromLocalFile(self._record_file))
+        self._player.setSource(QUrl.fromLocalFile(src))
         self.state = self.PLAYING
         self.status = "Воспроизведение…"
         self.state_changed.emit()
@@ -342,36 +355,74 @@ class AudioController(QObject):
         logger.info("[audio] %sms %s%s", elapsed_ms, name, (" " + extra) if extra else "")
 
     def save_last_recording(self, dest_dir: str | None = None) -> str | None:
-        """Сохраняет копию последней завершённой записи для диагностики.
+        """Сохраняет копию последней УСПЕШНО ЗАВЕРШЁННОЙ записи наружу.
 
-        Копия уходит во внешнюю папку (по умолчанию — Рабочий стол) и НЕ
-        удаляется при закрытии окна; временный оригинал следует обычному
-        жизненному циклу. Возвращает путь к копии или ``None``, если записи
-        нет (включая случай после shutdown). Копирование безопасно и во
-        время распознавания: это отдельное чтение того же файла.
+        Копия уходит во внешнюю папку (по умолчанию — Рабочий стол) и переживает
+        закрытие окна; временный оригинал (и сам временный каталог) удаляются.
+        Экспорт ВНУТРЬ управляемого временного каталога запрещён — такая копия
+        исчезла бы вместе с ним. Существующий файл не перезаписывается:
+        выбирается свободное имя. Возвращает путь к копии или ``None`` (нет
+        готовой записи, контроллер остановлен, либо отказ — причина в ``status``).
         """
-        if self._shutdown or self._record_file is None or not self.has_recording:
+        if self._shutdown:
+            self.status = "Сохранить нечего: контроллер остановлен."
+            self.state_changed.emit()
+            return None
+        if not self.has_recording:
             self.status = "Сохранить нечего: нет завершённой записи."
             self.state_changed.emit()
             return None
+        src = self._ready_recording
+        dest_dir = os.path.abspath(os.path.expanduser(dest_dir or "~/Desktop"))
 
-        src = self._record_file
-        dest_dir = os.path.abspath(dest_dir or os.path.expanduser("~/Desktop"))
+        # Запрет экспорта внутрь управляемого временного каталога: иначе копия
+        # уйдёт при закрытии вместе с временными файлами. Принадлежность
+        # проверяем по realpath (разрешая симв. ссылки) и commonpath —
+        # корректно, в отличие от строкового startswith.
+        if self._temp_dir is not None and self._is_within(dest_dir, self._temp_dir):
+            self.status = (
+                "Нельзя сохранять внутрь временного каталога — файл удалится "
+                "при закрытии. Укажи папку вне него (например, Рабочий стол)."
+            )
+            self.state_changed.emit()
+            return None
+
         try:
             os.makedirs(dest_dir, exist_ok=True)
             ext = os.path.splitext(src)[1] or ".m4a"
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dest = os.path.join(dest_dir, f"english-companion-{stamp}{ext}")
+            base = "english-companion"
+            # Не перезаписываем существующий файл (в т.ч. симссылку):
+            # ищем свободное имя.
+            dest = os.path.join(dest_dir, f"{base}{ext}")
+            n = 1
+            while os.path.lexists(dest):
+                dest = os.path.join(dest_dir, f"{base}-{n}{ext}")
+                n += 1
             shutil.copy2(src, dest)
         except OSError as exc:
             self.status = f"Не удалось сохранить запись: {exc}"
             self.state_changed.emit()
             return None
 
-        self._saved_files.add(dest)
         self.status = f"Запись сохранена: {dest}"
         self.state_changed.emit()
         return dest
+
+    @staticmethod
+    def _is_within(path: str, base: str) -> bool:
+        """``True``, если ``path`` совпадает с ``base`` или находится внутри него.
+
+        Сравниваем по ``os.path.realpath`` (разрешая символические ссылки) и
+        через ``os.path.commonpath`` — в отличие от строкового ``startswith``,
+        это корректно: ``/tmp/foo-evil`` не считается «внутри» ``/tmp/foo``.
+        """
+        real_path = os.path.realpath(path)
+        real_base = os.path.realpath(base)
+        try:
+            common = os.path.commonpath([real_path, real_base])
+        except ValueError:
+            return False  # разные диски — «внутри» быть не может
+        return common == real_base
 
     def _release_audio_output(self) -> None:
         """Явно отсоединяет QAudioOutput от QMediaPlayer и освобождает его.
@@ -447,6 +498,7 @@ class AudioController(QObject):
         self._cleanup_temp_dir()
 
         self._record_file = None
+        self._ready_recording = None
         self._record_seq = 0
         self.state = self.IDLE
         self.status = "Голос: остановлен"
@@ -525,6 +577,7 @@ class AudioController(QObject):
         self.state = self.IDLE
         self.status = "Ошибка записи: " + (message or error.name)
         self._record_file = None
+        self._ready_recording = None
         self._teardown_recording()
         self.state_changed.emit()
 
@@ -560,20 +613,31 @@ class AudioController(QObject):
     # --- Вспомогательные ---------------------------------------------------
 
     def _finalize_recording(self) -> None:
+        """Завершает сессию: запись публикуется «готовой» только при успехе.
+
+        Успех = рекордер подтвердил завершение (StoppedState) и файл непустой.
+        Сбой сессии или пустой файл => готовой записи нет (``_ready_recording``
+        не ставится, а ранее выставленная «готовность» снимается).
+        """
         if self.state == self.RECORDING:
             self.state = self.IDLE
             if self._session_failed:
-                # Ошибка сессии была: файл (даже не пустой) частичный —
-                # не оставляем его «готовым» ни в контроллере, ни в UI.
+                # Ошибка сессии: файл (даже не пустой) частичный — готовым
+                # не публикуем ни в контроллере, ни в UI.
                 self.status = "Ошибка записи — файл не считается готовым."
+                self._ready_recording = None
                 self._record_file = None
-            elif self.has_recording:
+            elif self._valid_recording_file(self._record_file):
+                # Готовность публикуем только после подтверждения завершения —
+                # «пишущийся» файл (состояние RECORDING) сюда не попадает.
+                self._ready_recording = self._record_file
                 self.status = "Запись готова. Можно «Прослушать»."
             else:
                 self.status = (
                     "Запись пуста — вероятно, нет доступа к микрофону. "
                     "Проверь разрешения macOS."
                 )
+                self._ready_recording = None
                 self._record_file = None
         # Флаг сессии завершён (успешно или со сбоем): следующая запись
         # стартует с чистого состояния.
@@ -620,25 +684,11 @@ class AudioController(QObject):
     def _cleanup_temp_dir(self) -> None:
         if self._temp_dir is None:
             return
-        # Сохранённые для диагностики копии не удаляем (на случай, если их
-        # попросили сохранить прямо во временную папку).
-        saved = {os.path.abspath(p) for p in self._saved_files}
+        # Экспорт ВНУТРЬ временного каталога запрещён (см. save_last_recording),
+        # поэтому здесь только временные файлы — их безопасно удаляем целиком.
+        # Копии, сохранённые НАРУЖУ, лежат вне каталога и не затрагиваются.
         try:
-            if saved:
-                for name in os.listdir(self._temp_dir):
-                    p = os.path.join(self._temp_dir, name)
-                    if os.path.abspath(p) in saved:
-                        continue
-                    if os.path.isdir(p):
-                        shutil.rmtree(p, ignore_errors=True)
-                    else:
-                        os.remove(p)
-                try:
-                    os.rmdir(self._temp_dir)
-                except OSError:
-                    pass  # в папке осталась сохранённая копия — оставляем
-            else:
-                shutil.rmtree(self._temp_dir)
+            shutil.rmtree(self._temp_dir)
         except OSError as exc:
             # Ошибку не гасим молча: так папка могла быть занята системой.
             logger.warning(
