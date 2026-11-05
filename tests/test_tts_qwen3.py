@@ -15,6 +15,7 @@ mlx-audio не нужен, модель не грузится, веса не с�
   компонент жив и следующий синтез успешен;
 * занятое аудио: автозапуска нет, ответ ждёт ручного повтора;
 * закрытие: поток остановлен, временных файлов нет, компонент мёртв;
+  сбой задания, пришедший после закрытия, — отброшен (без сигналов);
 * ``build_tts``: по умолчанию ``Qwen3TtsSynth`` (reference-режим,
   референс p4 в папке данных приложения), ``say`` — ``TtsSynth``,
   неизвестный движок — ошибка, ``reference`` без пары «файл + текст» —
@@ -325,6 +326,33 @@ class TestCloseDuringSynthesis(Qwen3TtsTestBase):
         _pump(0.1)
         self.assertTrue(self.c.tts.is_shutdown)
         self.assertEqual(self.c.state, AudioController.IDLE)
+
+    def test_late_failure_after_shutdown_is_dropped(self) -> None:
+        """Сбой задания, пришедший ПОСЛЕ shutdown: отброшен, без сигналов.
+
+        Фэйк-синтезатор держит ~2 c (таймаут gate), затем выбрасывает
+        исключение — то есть уже после того, как ``shutdown()`` выполнен.
+        Поздний сбой не публикуется: ``failed``/``state_changed`` не
+        уходят, статус «остановлено» не затирается, файлов нет — так же,
+        как поздний успех (``_finish_ready`` гасит ``_shutdown``).
+        """
+        self.fake.gate = threading.Event()  # НЕ set: фэйк сам выйдет через 2 c
+        self.fake.fail = True
+        self.c.speak_reply("Hello teacher")
+        time.sleep(0.2)  # рабочий поток вошёл в фэйк
+        self.c.shutdown()
+        _pump(0.2)
+        time.sleep(2.5)  # поздний сбой уже «пришёл»
+        _pump(0.3)
+        self.assertEqual(self.failed_reasons, [], "поздний failed после shutdown")
+        self.assertEqual(self.ready_paths, [], "готовый после shutdown")
+        self.assertEqual(self.c.tts.status, "Озвучивание: остановлено")
+        self.assertEqual(self.c.tts.state, self.c.tts.IDLE)
+        self.assertFalse(self.c.tts._temp_dir, "осталась временная папка")
+        workers = [t for t in threading.enumerate() if t.name == "tts-qwen3"]
+        self.assertTrue(
+            all(not t.is_alive() for t in workers), "рабочий поток жив"
+        )
 
 
 class TestMissingReferenceFile(unittest.TestCase):

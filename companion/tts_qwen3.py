@@ -358,7 +358,15 @@ class Qwen3TtsSynth(QObject):
 
     def _finish_failed(self, job_id: int, reason: str) -> None:
         with self._lock:
-            if job_id != self._job_seq:
+            if job_id != self._job_seq or self._shutdown:
+                # Компонент закрывают/закрыт: поздний сбой отбрасываем
+                # (как поздний успех в ``_finish_ready``) — без сигналов
+                # и без затирания статуса «остановлено».
+                if self._shutdown:
+                    logger.info(
+                        "tts-qwen3: сбой job=%d отброшен (компонент закрыт)",
+                        job_id,
+                    )
                 return
         self._drop_file(self._current_path)
         self._current_path = None
