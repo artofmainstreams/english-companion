@@ -62,6 +62,9 @@ class MainWindow(QMainWindow):
         self.play_button = QPushButton("Прослушать")
         self.recognize_button = QPushButton("Распознать")
         self.save_button = QPushButton("Сохранить")
+        # «Повторить ответ» — повторный проигрыш последней готовой
+        # голосовой реплики преподавателя, без нового запроса к Ollama.
+        self.repeat_button = QPushButton("Повторить ответ")
         self.audio_status_label = QLabel("Голос: готов")
         self.stt_status_label = QLabel("Распознавание: готов")
 
@@ -82,6 +85,7 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_play)
         self.recognize_button.clicked.connect(self.start_recognition)
         self.save_button.clicked.connect(self.save_recording)
+        self.repeat_button.clicked.connect(self.repeat_reply)
         self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
 
         input_layout = QHBoxLayout()
@@ -93,6 +97,7 @@ class MainWindow(QMainWindow):
         audio_layout.addWidget(self.play_button)
         audio_layout.addWidget(self.recognize_button)
         audio_layout.addWidget(self.save_button)
+        audio_layout.addWidget(self.repeat_button)
         audio_layout.addWidget(QLabel("Микрофон:"))
         audio_layout.addWidget(self.mic_combo)
         audio_layout.addWidget(self.audio_status_label, 1)
@@ -141,7 +146,10 @@ class MainWindow(QMainWindow):
 
     def append_message(self, message: Message) -> None:
         speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
+        # Текст сразу виден в чате; затем — озвучивание реплики преподавателя.
         self.history.appendPlainText(f"{speaker}: {message.content}\n")
+        if message.role == "assistant":
+            self.audio.speak_reply(message.content)
 
     def select_model(self) -> None:
         self.controller.select_model(self.model_combo.currentText())
@@ -170,6 +178,10 @@ class MainWindow(QMainWindow):
         # Сохранить доступна для завершённой записи; после shutdown
         # has_recording становится False (путь сбрасывается).
         self.save_button.setEnabled(audio.has_recording)
+
+        # «Повторить ответ»: только если есть готовая реплика и аудио
+        # свободно (запись/воспроизведение не идут). После shutdown — нет.
+        self.repeat_button.setEnabled(audio.can_replay)
 
         # Переключение микрофона — только вне записи (требование);
         # после shutdown контроллер не работает, комбо блокируем тоже.
@@ -298,6 +310,15 @@ class MainWindow(QMainWindow):
             self.audio.stop_playback()
         else:
             self.audio.play()
+
+    def repeat_reply(self) -> None:
+        """«Повторить ответ»: повторный проигрыш последней готовой реплики.
+
+        Новый запрос к Ollama не выполняется — играет тот же готовый файл.
+        Если готового ответа нет или аудио занято, фасад публикует причину
+        в строку статуса.
+        """
+        self.audio.replay_reply()
 
     def save_recording(self) -> None:
         """Сохраняет копию последней записи для диагностики (путь — в статусе)."""

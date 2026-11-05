@@ -1,16 +1,19 @@
-"""Фасад аудиослоя: запись и воспроизведение в одном слое для UI.
+"""Фасад аудиослоя: запись, воспроизведение и озвучивание ответов.
 
-Аудиослой разбит на два независимых компонента:
+Аудиослой разбит на независимые компоненты:
 
   * :class:`companion.audio_recorder.AudioRecorder` — устройства ввода,
     запись, результат успешно завершённой записи; явный владелец своих
     временных файлов (создаёт и удаляет их);
   * :class:`companion.audio_player.AudioPlayer` — воспроизведение любого
     готового аудиофайла; файл ему НЕ принадлежит, и плеер его никогда
-    не удаляет (это же позволит проигрывать TTS-файлы ответов).
+    не удаляет (это же позволяет проигрывать TTS-файлы ответов);
+  * :class:`companion.tts_synth.TtsSynth` — озвучивание ответов
+    преподавателя (macOS ``say`` → временный AIFF); владелец своих
+    временных файлов; готовый файл публикует сигналом.
 
-``AudioController`` — тонкий фасад с прежним публичным API, поэтому UI
-(``MainWindow``) и сборка приложения (``main.py``) не меняются:
+``AudioController`` — фасад с прежним публичным API плюс действия
+озвучивания (``speak_reply``/``replay_reply``):
 
   * единое производное состояние ``IDLE/RECORDING/PLAYING``;
   * ``state``/``status`` синхронизируются из компонента, который
@@ -18,30 +21,46 @@
     с рекордера;
   * взаимное исключение записи и воспроизведения — молчаливый отказ,
     как раньше;
+  * автозапуск готового ответа согласован с записью и воспроизведением:
+    если аудио занято, ответ сохраняется для ручного «Повторить ответ»;
   * порядок ``shutdown()``: сначала плеер останавливается и отпускает
-    файл и выход (файл при этом НЕ удаляется), потом рекордер разбирает
-    сессию и удаляет СВОИ временные файлы.
+    файл и выход (файл при этом НЕ удаляется), потом синтез останавливает
+    процесс ``say``, потом рекордер разбирает сессию; каждый компонент
+    удаляет СВОИ временные файлы.
 """
+
+import os
 
 from PySide6.QtCore import QObject, Signal
 
 from .audio_player import AudioPlayer
 from .audio_recorder import AudioRecorder
+from .tts_synth import DEFAULT_VOICE, TtsSynth
 
 
 class AudioController(QObject):
-    """Управляет записью и воспроизведением речи без блокировки интерфейса.
+    """Управляет записью, воспроизведением и озвучиванием ответов.
 
     Работает как отдельный слой (как SessionController/OllamaClient):
     MainWindow только показывает состояние и вызывает методы, сам Qt
     Multimedia живёт в компонентах и не мешает текстовому чату.
 
+    Озвучивание ответов:
+    * ``speak_reply(text)`` запускает синтез (``TtsSynth``); готовый файл
+      автозапускается, только если аудио свободно (IDLE);
+    * если аудио занято (запись/воспроизведение), готовый ответ сохраняется
+      и ждёт ручного ``replay_reply()``;
+    * ``replay_reply()`` проигрывает последний готовый ответ БЕЗ нового
+      запроса к Ollama и без нового синтеза.
+
     Жизненный цикл:
     * ``shutdown()`` идемпотентна — повторные вызовы безопасны;
-    * после ``shutdown()`` ``record()``/``play()`` отклоняются, а поздние
-      сигналы Qt игнорируются (состояние больше не «оживает»);
-    * разбор по порядку: остановка плеера → выход → разбор сессии записи
-      → удаление временных файлов рекордера.
+    * после ``shutdown()`` ``record()``/``play()``/``speak_reply()``/
+      ``replay_reply()`` отклоняются, а поздние сигналы Qt игнорируются
+      (состояние больше не «оживает»);
+    * разбор по порядку: остановка плеера → выход → остановка синтеза
+      (процесс ``say``) → разбор сессии записи; каждый компонент удаляет
+      СВОИ временные файлы.
     """
 
     state_changed = Signal()
@@ -53,17 +72,26 @@ class AudioController(QObject):
     RECORDING = "recording"
     PLAYING = "playing"
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        tts_voice: str = DEFAULT_VOICE,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self.status = "Голос: готов"
 
         self.player = AudioPlayer(self)
         self.recorder = AudioRecorder(self)
+        self.tts = TtsSynth(tts_voice, self)
 
         # Статус и состояние синхронизируются из компонента, который
         # последний раз подал state_changed.
         self.player.state_changed.connect(self._sync_from_player)
         self.recorder.state_changed.connect(self._sync_from_recorder)
+        self.tts.state_changed.connect(self._sync_from_tts)
+        # Готовый/сбойный синтез — отдельные сигналы: автозапуск и статус.
+        self.tts.reply_ready.connect(self._on_reply_ready)
+        self.tts.failed.connect(self._on_reply_failed)
         self.recorder.devices_changed.connect(self.devices_changed.emit)
 
         # Флаг shutdown фасада: после него он не реагирует на сигналы
@@ -109,6 +137,20 @@ class AudioController(QObject):
     def last_recording_path(self) -> str | None:
         """Путь последней успешно завершённой записи (у рекордера)."""
         return self.recorder.last_recording_path
+
+    @property
+    def has_reply(self) -> bool:
+        """Есть ли готовый голосовой ответ (у синтезатора)."""
+        return self.tts.has_reply
+
+    @property
+    def can_replay(self) -> bool:
+        """Можно «Повторить ответ»: аудио свободно и ответ готов."""
+        return (
+            not self._shutdown
+            and self.state == self.IDLE
+            and self.tts.has_reply
+        )
 
     # --- Устройства ввода (делегирование рекордеру) ------------------------
 
@@ -162,19 +204,57 @@ class AudioController(QObject):
             return
         self.player.stop()
 
+    def speak_reply(self, text: str) -> None:
+        """Озвучивает ответ преподавателя (синтез ``say`` → AIFF).
+
+        Синтез — это процесс, пишущий файл: он не занимает микрофон и
+        выход, поэтому запускается независимо от записи. Согласование
+        происходит на шаге ВОСПРОИЗВЕДЕНИЯ: готовый файл автозапускается,
+        только если аудио свободно; иначе ответ сохраняется для
+        ручного ``replay_reply()``. После ``shutdown()`` отклоняется.
+        """
+        if self._shutdown:
+            return
+        self.tts.synthesize(text)
+
+    def replay_reply(self) -> None:
+        """Повторяет последний готовый голосовой ответ.
+
+        Новый запрос к Ollama и новый синтез НЕ выполняются — проигрывается
+        тот же готовый файл (``TtsSynth.last_reply_path``). Запрещено,
+        пока идёт запись/воспроизведение, или если готового ответа нет
+        (причина публикуется в ``status``).
+        """
+        if self._shutdown or self.state != self.IDLE:
+            return
+        path = self.tts.last_reply_path
+        if path is None:
+            self.status = "Повторять нечего: нет готового ответа."
+            self.state_changed.emit()
+            return
+        if not os.path.exists(path):
+            self.status = "Нет аудиофайла для воспроизведения."
+            self.state_changed.emit()
+            return
+        # Файл принадлежит синтезатору; плеер его не удаляет.
+        self.player.play(path)
+
     def save_last_recording(self, dest_dir: str | None = None) -> str | None:
         return self.recorder.save_last_recording(dest_dir)
 
     def shutdown(self) -> None:
-        """Останавливает запись/воспроизведение и разбирает оба компонента.
+        """Останавливает запись, воспроизведение и синтез; разбирает слой.
 
         Идемпотентна: повторные вызовы (например, ``aboutToQuit`` и явный
         вызов из кода) безопасны. После вызова слой не работает:
-        ``record()``/``play()`` отклоняются, поздние сигналы Qt игнорируются.
+        ``record()``/``play()``/``speak_reply()``/``replay_reply()``
+        отклоняются, поздние сигналы Qt игнорируются.
 
         Порядок важен: сначала плеер останавливается и отпускает файл/выход
-        (файл он НЕ удаляет — владелец файла это делает), потом рекордер
-        разбирает сессию и удаляет СВОИ временные файлы.
+        (файл он НЕ удаляет — владелец файла это делает), потом синтез
+        останавливает процесс ``say`` (он мог писать файл) и удаляет СВОИ
+        временные файлы, потом рекордер разбирает сессию и удаляет СВОИ
+        временные файлы.
         """
         if self._shutdown:
             return
@@ -184,7 +264,11 @@ class AudioController(QObject):
         #    Переданный ранее файл при этом НЕ удаляется.
         self.player.shutdown()
 
-        # 2) Рекордер: отключение hotplug, разбор графа, временные файлы.
+        # 2) Синтез: остановка процесса say (до удаления временных файлов!),
+        #    затем удаление его СВОИХ временных файлов.
+        self.tts.shutdown()
+
+        # 3) Рекордер: отключение hotplug, разбор графа, временные файлы.
         self.recorder.shutdown()
 
         self.status = "Голос: остановлен"
@@ -204,4 +288,35 @@ class AudioController(QObject):
         if self._shutdown:
             return
         self.status = self.recorder.status
+        self.state_changed.emit()
+
+    def _sync_from_tts(self) -> None:
+        """Синтезатор подал state_changed: обновляем фасадный статус и сигнал."""
+        if self._shutdown:
+            return
+        self.status = self.tts.status
+        self.state_changed.emit()
+
+    def _on_reply_ready(self, path: str) -> None:
+        """Синтез завершён успешно: автозапуск, если аудио свободно.
+
+        Согласование с записью и воспроизведением: если аудио занято
+        (RECORDING/PLAYING), файл НЕ запускаем — он остаётся готовым
+        ответом для ручного ``replay_reply()``.
+        """
+        if self._shutdown:
+            return
+        if self.state == self.IDLE:
+            self.player.play(path)
+            return
+        self.status = (
+            "Ответ готов; аудио занято — нажми «Повторить ответ»."
+        )
+        self.state_changed.emit()
+
+    def _on_reply_failed(self, reason: str) -> None:
+        """Синтез не удался: понятный статус; текст ответа остаётся в чате."""
+        if self._shutdown:
+            return
+        self.status = f"Не удалось озвучить ответ: {reason}"
         self.state_changed.emit()

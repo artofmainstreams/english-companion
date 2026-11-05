@@ -17,7 +17,8 @@ def main() -> int:
     config = AppConfig()
     client = OllamaClient(config, app)
     controller = SessionController(client, app)
-    audio = AudioController(app)
+    # Озвучивание ответов: английский голос macOS say из конфига.
+    audio = AudioController(config.tts_voice, app)
     # Реализация STT выбирается при сборке приложения, а не в движке:
     # неизвестный stt_backend — понятная ошибка здесь, а не при первом
     # распознавании.

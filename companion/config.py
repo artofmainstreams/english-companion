@@ -1,11 +1,19 @@
 from dataclasses import dataclass
 
+from .tts_synth import DEFAULT_VOICE
+
 
 @dataclass(frozen=True)
 class AppConfig:
     ollama_base_url: str = "http://127.0.0.1:11434"
     request_timeout_ms: int = 10_000
     chat_timeout_ms: int = 180_000
+
+    # Озвучивание ответов преподавателя (TTS): английский голос macOS say.
+    # Имя проверяется списком голосов: ``say -v '?'``. Если голоса на системе
+    # нет, say молча возьмёт голос по умолчанию — это поведение macOS,
+    # компонент синтеза на него не влияет.
+    tts_voice: str = DEFAULT_VOICE
 
     # Локальное распознавание речи.
     # stt_backend: "mlx" (по умолчанию; macOS arm64 + системный ffmpeg) или
