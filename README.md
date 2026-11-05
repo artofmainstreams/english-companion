@@ -259,3 +259,25 @@ espeak-ng 1.52.0 (Homebrew). Примечания: `misaki` не деклари�
 `qwen3_vd_A.wav` / `qwen3_vd_B.wav` пишутся рядом с `bf_emma.wav`
 (по умолчанию `~/Desktop/kokoro-voices`) — вне Git.
 
+### Понижение высоты готовых образцов (Rubber Band)
+
+`tools/pitch_shift_voices.py` — для каждого готового WAV версии:
+исходная + ниже на 1 и 2 полутона (или свой список `--semitones`).
+Обработка существующих записей, без повторного синтеза:
+
+```bash
+brew install rubberband   # движок, если ещё не установлен
+
+# A и B: orig / −1 ст / −2 ст рядом (6 WAV), громкость партии выровнена:
+<env>/bin/python tools/pitch_shift_voices.py \
+    ~/Desktop/kokoro-voices/qwen3_vd_A.wav ~/Desktop/kokoro-voices/qwen3_vd_B.wav \
+    --outdir ~/Desktop/qwen-voice-comparison
+```
+
+Метод: Rubber Band R3 (`-3`), `-F` — сохранение формантов (понижение
+не делает голос глухим), `-t 1` — длительность, темп и паузы
+сохраняются точно; громкость партии выравнивается по RMS к самой
+громкой версии (линейное усиление, пик ≤ 0.98). Без эквализации
+и компрессии. Имя выходного файла: `<база>_orig.wav`, `<база>_m1.wav`,
+`<база>_m2.wav` (mN — ниже на N полутонов). Результаты — вне Git.
+
