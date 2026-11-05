@@ -15,8 +15,12 @@ mlx-audio не нужен, модель не грузится, веса не с�
   компонент жив и следующий синтез успешен;
 * занятое аудио: автозапуска нет, ответ ждёт ручного повтора;
 * закрытие: поток остановлен, временных файлов нет, компонент мёртв;
-* ``build_tts``: по умолчанию ``TtsSynth``, ``qwen3`` — ``Qwen3TtsSynth``
-  (режимы voice_design/reference), неизвестный движок — ошибка.
+* ``build_tts``: по умолчанию ``Qwen3TtsSynth`` (reference-режим,
+  референс p4 в папке данных приложения), ``say`` — ``TtsSynth``,
+  неизвестный движок — ошибка, ``reference`` без пары «файл + текст» —
+  ошибка;
+* отсутствие файла референса: ``failed`` с понятной причиной
+  (проверка ДО загрузки модели — тест работает без mlx-audio).
 
 Слышимость и качество голоса — ручная проверка (см. README и
 ``tools/qwen3_voice_consistency_check.py``).
@@ -25,6 +29,7 @@ mlx-audio не нужен, модель не грузится, веса не с�
 import faulthandler
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -47,8 +52,12 @@ from companion.audio_controller import (  # noqa: E402
 )
 from companion.audio_player import AudioPlayer  # noqa: E402
 from companion.audio_recorder import AudioRecorder  # noqa: E402
+from companion.app_data import tts_reference_path  # noqa: E402
 from companion.config import AppConfig  # noqa: E402
-from companion.tts_qwen3 import Qwen3TtsSynth  # noqa: E402
+from companion.tts_qwen3 import (  # noqa: E402
+    DEFAULT_MODEL_REFERENCE,
+    Qwen3TtsSynth,
+)
 from companion.tts_synth import TtsSynth  # noqa: E402
 
 _QAPP: QApplication | None = None
@@ -318,18 +327,77 @@ class TestCloseDuringSynthesis(Qwen3TtsTestBase):
         self.assertEqual(self.c.state, AudioController.IDLE)
 
 
+class TestMissingReferenceFile(unittest.TestCase):
+    """Отсутствие файла референса: понятная ошибка, модель не грузится.
+
+    Проверка выполняется ДО импорта mlx-audio и загрузки модели, поэтому
+    тест работает офлайн: mlx не нужен, веса не скачиваются.
+    """
+
+    def test_missing_ref_file_fails_with_clear_reason(self) -> None:
+        missing = os.path.join(tempfile.gettempdir(), "no_such_tts_ref.wav")
+        self.assertFalse(os.path.exists(missing))
+        synth = Qwen3TtsSynth(
+            model_id=DEFAULT_MODEL_REFERENCE,
+            ref_audio=missing,
+            ref_text="That was a really good answer.",
+        )
+        try:
+            self.assertEqual(synth.mode, "reference")
+            failures: list[str] = []
+            synth.failed.connect(failures.append)
+            self.assertTrue(synth.synthesize("Hello teacher"))
+            # Дожидаемся сигнала failed (рабочий поток); межпотоковая
+            # доставка требует обработки событий Qt в главном потоке.
+            app = QApplication.instance() or QApplication(sys.argv)
+            deadline = time.time() + 5.0
+            while not failures and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.05)
+            self.assertEqual(len(failures), 1, "не пришёл failed")
+            reason = failures[0]
+            self.assertIn("референс", reason)
+            self.assertIn("не найден", reason)
+            self.assertIn(missing, reason)
+            self.assertFalse(synth.has_reply, "готовый ответ при сбое")
+            self.assertEqual(synth.state, synth.IDLE)
+            # Модель НЕ загружалась (файла нет — проверка до модели):
+            self.assertIsNone(synth._model, "модель грузилась без необходимости")
+        finally:
+            synth.shutdown()
+
+
 class TestBuildTts(unittest.TestCase):
     """build_tts: выбор движка по конфигу — без загрузки моделей."""
 
-    def test_default_engine_is_say(self) -> None:
+    def test_default_engine_is_qwen3_reference(self) -> None:
+        # По умолчанию — Qwen3 reference-режим, референс p4 в папке данных.
         tts = build_tts(AppConfig())
+        try:
+            self.assertIsInstance(tts, Qwen3TtsSynth)
+            self.assertEqual(tts.mode, "reference")
+            self.assertEqual(
+                tts.model_id, "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+            )
+            self.assertEqual(tts.ref_audio, str(tts_reference_path()))
+            self.assertEqual(
+                tts.ref_text,
+                "That was a really good answer. You explained your idea, "
+                "gave an example, and kept your rhythm natural.",
+            )
+        finally:
+            tts.shutdown()
+
+    def test_say_engine(self) -> None:
+        config = AppConfig(tts_engine="say")
+        tts = build_tts(config)
         try:
             self.assertIsInstance(tts, TtsSynth)
         finally:
             tts.shutdown()
 
     def test_qwen3_voice_design(self) -> None:
-        config = AppConfig(tts_engine="qwen3")
+        config = AppConfig(tts_engine="qwen3", tts_qwen3_method="voice_design")
         tts = build_tts(config)
         try:
             self.assertIsInstance(tts, Qwen3TtsSynth)
@@ -362,9 +430,23 @@ class TestBuildTts(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_tts(AppConfig(tts_engine="kokoro"))
 
-    def test_default_config_is_say(self) -> None:
-        # Переключение на Qwen3 — только явным решением (после прослушивания).
-        self.assertEqual(AppConfig().tts_engine, "say")
+    def test_default_config_is_qwen3_reference(self) -> None:
+        # Голос p4 одобрен: по умолчанию Qwen3 reference-режим.
+        config = AppConfig()
+        self.assertEqual(config.tts_engine, "qwen3")
+        self.assertEqual(config.tts_qwen3_method, "reference")
+        self.assertEqual(config.tts_qwen3_ref_audio, str(tts_reference_path()))
+        self.assertTrue(config.tts_qwen3_ref_text)
+
+    def test_reference_mode_without_pair_rejected(self) -> None:
+        # reference без пары «файл + текст» — явная ошибка, не смена режима.
+        for kwargs in (
+            {"tts_qwen3_ref_audio": "", "tts_qwen3_ref_text": "text"},
+            {"tts_qwen3_ref_audio": "/tmp/ref.wav", "tts_qwen3_ref_text": ""},
+            {"tts_qwen3_ref_audio": "", "tts_qwen3_ref_text": ""},
+        ):
+            with self.assertRaises(ValueError, msg=str(kwargs)):
+                build_tts(AppConfig(tts_engine="qwen3", **kwargs))
 
 
 if __name__ == "__main__":

@@ -50,12 +50,13 @@ from .tts_synth import DEFAULT_VOICE, TtsSynth
 def build_tts(config: AppConfig, parent: QObject | None = None) -> QObject:
     """Выбирает движок озвучивания по конфигу (``tts_engine``).
 
-    ``"say"`` (по умолчанию) — :class:`companion.tts_synth.TtsSynth`;
-    ``"qwen3"`` — :class:`companion.tts_qwen3.Qwen3TtsSynth` (mlx_audio
-    импортируется лениво, в рабочем потоке первого синтеза). Оба — с
-    одинаковым публичным API: состояния, ``synthesize``/``shutdown``,
+    ``"qwen3"`` (по умолчанию) — :class:`companion.tts_qwen3.Qwen3TtsSynth`
+    (mlx_audio импортируется лениво, в рабочем потоке первого синтеза);
+    ``"say"`` — :class:`companion.tts_synth.TtsSynth` (резервный движок).
+    Оба — с одинаковым публичным API: состояния, ``synthesize``/``shutdown``,
     сигналы ``state_changed``/``reply_ready``/``failed``. Неизвестный
-    движок — явная ошибка (без тихой замены), как с STT-бэкендами.
+    движок — явная ошибка (без тихой замены), как с STT-бэкендами;
+    ``reference``-режим без пары «файл + текст» — тоже явная ошибка.
     """
     engine = (config.tts_engine or "say").strip().lower()
     if engine == "say":
@@ -63,14 +64,27 @@ def build_tts(config: AppConfig, parent: QObject | None = None) -> QObject:
     if engine == "qwen3":
         method = (config.tts_qwen3_method or "voice_design").strip().lower()
         if method == "reference":
+            if not (config.tts_qwen3_ref_audio and config.tts_qwen3_ref_text):
+                # reference-режим без пары (файл + точный текст) не может
+                # работать — явная ошибка, а не тихая смена на voice_design.
+                raise ValueError(
+                    "tts_qwen3_method='reference' требует непустых "
+                    "tts_qwen3_ref_audio И tts_qwen3_ref_text"
+                )
             model_id = config.tts_qwen3_model_reference
+            ref_audio = config.tts_qwen3_ref_audio
+            ref_text = config.tts_qwen3_ref_text
         else:
             model_id = config.tts_qwen3_model_voice_design
+            # Пару референса НЕ передаём: режим синтезатора определяется
+            # непустой парой — в voice_design она должна быть пуста.
+            ref_audio = ""
+            ref_text = ""
         return Qwen3TtsSynth(
             model_id=model_id,
             instruct=config.tts_qwen3_instruct,
-            ref_audio=config.tts_qwen3_ref_audio,
-            ref_text=config.tts_qwen3_ref_text,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
             parent=parent,
         )
     raise ValueError(

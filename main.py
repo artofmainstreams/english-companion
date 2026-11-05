@@ -18,8 +18,8 @@ def main() -> int:
     client = OllamaClient(config, app)
     controller = SessionController(client, app)
     # Озвучивание ответов: движок TTS из конфига (tts_engine):
-    # "say" (по умолчанию; голос config.tts_voice) или "qwen3"
-    # (Qwen3-TTS, MLX; ленивая загрузка модели в рабочем потоке).
+    # "qwen3" (по умолчанию; Qwen3-TTS MLX, reference-режим с референсом
+    # p4; ленивая загрузка модели в рабочем потоке) или "say" (резерв).
     audio = AudioController(parent=app, tts=build_tts(config))
     # Реализация STT выбирается при сборке приложения, а не в движке:
     # неизвестный stt_backend — понятная ошибка здесь, а не при первом

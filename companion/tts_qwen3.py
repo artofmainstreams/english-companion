@@ -65,8 +65,13 @@ DEFAULT_INSTRUCT = (
 # voice_design — описание голоса; reference (Base) — клонирование по референсу.
 DEFAULT_MODEL_VOICE_DESIGN = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
 DEFAULT_MODEL_REFERENCE = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
-# Точный текст первой реплики варианта D (референс способа reference).
-DEFAULT_REF_TEXT = "Hi! How was your day? Tell me one thing you enjoyed."
+# Точный текст референса способа reference — одобренная реплика p4
+# (4-я реплика VoiceDesign варианта D; файл qwen3_D_vd_p4.wav).
+# Расшифровка faster-whisper large-v3: все 18 слов совпадают.
+DEFAULT_REF_TEXT = (
+    "That was a really good answer. You explained your idea, "
+    "gave an example, and kept your rhythm natural."
+)
 
 # Метка очереди: «остановись» (shutdown).
 _SENTINEL = object()
@@ -276,6 +281,16 @@ class Qwen3TtsSynth(QObject):
 
     def _make_audio(self, text: str) -> "tuple[np.ndarray, int]":
         """Синтез одной реплики; (float-массив, частота дискретизации)."""
+        if self.mode == "reference" and not os.path.exists(self.ref_audio):
+            # Понятная ошибка ДО загрузки модели (и до её скачивания):
+            # референс должен быть восстановлен установщиком.
+            raise RuntimeError(
+                "референс голоса не найден: "
+                f"{self.ref_audio or '<пусто>'}. "
+                "Восстанови файл: "
+                ".venv/bin/python tools/install_tts_reference.py "
+                "(подробности — в README)."
+            )
         if self._synthesizer is not None:
             result = self._synthesizer(text)
             audio, sample_rate = result

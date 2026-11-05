@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from .app_data import tts_reference_path
 from .tts_qwen3 import (
     DEFAULT_INSTRUCT,
     DEFAULT_MODEL_REFERENCE,
@@ -16,11 +17,10 @@ class AppConfig:
     chat_timeout_ms: int = 180_000
 
     # Озвучивание ответов преподавателя (TTS).
-    # tts_engine: "say" (по умолчанию; macOS say, голос — tts_voice) или
-    # "qwen3" (локальная Qwen3-TTS, MLX; синтез — фоновый поток).
-    # Переключение — только после прослушивания образцов (см. README
-    # и tools/qwen3_voice_consistency_check.py).
-    tts_engine: str = "say"
+    # tts_engine: "qwen3" (по умолчанию; локальная Qwen3-TTS, MLX; синтез —
+    # фоновый поток, голос — референс p4; см. README) или "say"
+    # (macOS say, голос — tts_voice) как резервный движок.
+    tts_engine: str = "qwen3"
     # Английский голос macOS say (только tts_engine="say"). Имя
     # проверяется списком голосов: ``say -v '?'``. Если голоса на системе
     # нет, say молча возьмёт голос по умолчанию — это поведение macOS,
@@ -28,17 +28,23 @@ class AppConfig:
     tts_voice: str = DEFAULT_VOICE
 
     # Qwen3-TTS (tts_engine="qwen3"):
-    # tts_qwen3_method: "voice_design" (модель + описание голоса в
-    # tts_qwen3_instruct) или "reference" (модель Base + одна чистая
-    # реплика tts_qwen3_ref_audio и её точный текст tts_qwen3_ref_text);
-    # веса моделей — в кэше Hugging Face (~4 GiB), вне репозитория.
-    tts_qwen3_method: str = "voice_design"
+    # tts_qwen3_method: "reference" (по умолчанию: модель Base + одна
+    # чистая реплика tts_qwen3_ref_audio и её точный текст
+    # tts_qwen3_ref_text — одобренный голос p4) или "voice_design"
+    # (модель + описание голоса tts_qwen3_instruct).
+    # Weights — в кэше Hugging Face (~4 GiB), вне репозитория.
+
+    tts_qwen3_method: str = "reference"
     tts_qwen3_model_voice_design: str = DEFAULT_MODEL_VOICE_DESIGN
     tts_qwen3_model_reference: str = DEFAULT_MODEL_REFERENCE
-    # Описание голоса — выбранный голос D (образец qwen3_low_D.wav).
+    # Описание голоса — выбранный голос D (образец qwen3_low_D.wav);
+    # используется, только если tts_qwen3_method == "voice_design".
     tts_qwen3_instruct: str = DEFAULT_INSTRUCT
-    # Референс способа "reference" (пустой ref_audio = режим выключен).
-    tts_qwen3_ref_audio: str = ""
+    # Референс способа "reference": файл кладётся в постоянную папку
+    # данных приложения (переживает переустановку; установка —
+    # tools/install_tts_reference.py). При отсутствии файла синтез
+    # завершается понятной ошибкой (см. tts_qwen3.py).
+    tts_qwen3_ref_audio: str = str(tts_reference_path())
     tts_qwen3_ref_text: str = DEFAULT_REF_TEXT
 
     # Локальное распознавание речи.
