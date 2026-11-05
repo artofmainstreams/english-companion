@@ -7,6 +7,7 @@ from companion.config import AppConfig
 from companion.main_window import MainWindow
 from companion.ollama_client import OllamaClient
 from companion.audio_controller import AudioController
+from companion.stt_backends import build_backend
 from companion.stt_engine import SttEngine
 from companion.session_controller import SessionController
 
@@ -17,7 +18,10 @@ def main() -> int:
     client = OllamaClient(config, app)
     controller = SessionController(client, app)
     audio = AudioController(app)
-    stt = SttEngine(config, app)
+    # Реализация STT выбирается при сборке приложения, а не в движке:
+    # неизвестный stt_backend — понятная ошибка здесь, а не при первом
+    # распознавании.
+    stt = SttEngine(build_backend(config), app)
     window = MainWindow(controller, audio, stt)
     window.show()
 

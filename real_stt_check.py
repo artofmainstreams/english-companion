@@ -55,7 +55,7 @@ def _make_tone_wav(path: str, seconds: int = 2, hz: float = 440.0) -> None:
 def main(argv: list[str]) -> int:
     _ensure_project_on_path()
     from companion.config import AppConfig
-    from companion.stt_engine import SttEngine
+    from companion.stt_backends import build_backend
 
     # Опционально: --backend mlx|faster-whisper (иначе — дефолт AppConfig).
     backend = None
@@ -97,19 +97,19 @@ def main(argv: list[str]) -> int:
 
     print(f"Аудио ({source}): {audio_path}")
 
-    engine = SttEngine(config)
+    backend = build_backend(config)
 
     # 1) Загрузка модели — отдельный замер (при первом запуске скачивает веса).
     print("\n[1] Загрузка модели…")
     t0 = time.perf_counter()
-    model = engine._ensure_model()
+    model = backend.load_model()
     load_s = time.perf_counter() - t0
     print(f"    модель: {type(model).__name__} · загрузка: {load_s:.2f} с")
 
     # 2) Распознавание (модель уже загружена) — первый замер.
     print("\n[2] Распознавание #1…")
     t0 = time.perf_counter()
-    text1 = engine._run_transcribe(model, audio_path).strip()
+    text1 = backend.transcribe(model, audio_path).strip()
     t1 = time.perf_counter() - t0
     print(f"    результат: {text1!r}")
     print(f"    распознавание #1: {t1:.2f} с")
@@ -117,7 +117,7 @@ def main(argv: list[str]) -> int:
     # 3) Повторное распознавание (модель переиспользуется) — отдельный замер.
     print("\n[3] Повторное распознавание #2…")
     t0 = time.perf_counter()
-    text2 = engine._run_transcribe(model, audio_path).strip()
+    text2 = backend.transcribe(model, audio_path).strip()
     t2 = time.perf_counter() - t0
     print(f"    результат: {text2!r}")
     print(f"    распознавание #2 (повторное): {t2:.2f} с")

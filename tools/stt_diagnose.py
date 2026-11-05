@@ -2,8 +2,8 @@
 """Диагностика распознавания одного аудиофайла.
 
 Без изменения настроек приложения сравнивает:
-  A) рабочий SttEngine (путь приложения: AppConfig() → _ensure_model() →
-     _run_transcribe — фактический бэкенд и модель из конфига);
+  A) рабочий backend (путь приложения: AppConfig() → build_backend() →
+     load_model() → transcribe() — фактический бэкенд и модель из конфига);
   B) прямой вызов mlx_whisper.transcribe с ИДЕНТИЧНЫМИ параметрами
      (path_or_hf_repo / language / task), включая метрики сегментов, которые
      библиотека отдаёт (avg_logprob, compression_ratio, no_speech_prob);
@@ -63,7 +63,7 @@ def _print_mlx_segments(result: dict) -> None:
 
 
 def _run_engine(config, label: str) -> None:
-    from companion.stt_engine import SttEngine
+    from companion.stt_backends import build_backend
 
     print(f"\n=== {label} ===")
     print(
@@ -73,15 +73,15 @@ def _run_engine(config, label: str) -> None:
         f"vad_filter={config.stt_vad_filter} "
         f"(device={config.stt_device}, compute_type={config.stt_compute_type})"
     )
-    stt = SttEngine(config)
+    backend = build_backend(config)
 
     t0 = time.perf_counter()
-    model = stt._ensure_model()
+    model = backend.load_model()
     load_s = time.perf_counter() - t0
     print(f"  загрузка модели: {load_s:.2f} с ({type(model).__name__})")
 
     t0 = time.perf_counter()
-    text = stt._run_transcribe(model, AUDIO_PATH).strip()
+    text = backend.transcribe(model, AUDIO_PATH).strip()
     dt = time.perf_counter() - t0
     print(f"  распознавание: {dt:.2f} с")
     print(f"  ТЕКСТ: {text!r}")
@@ -143,7 +143,7 @@ def main() -> int:
     default = AppConfig()
 
     # A) Путь приложения (фактический бэкенд и модель из AppConfig по умолчанию).
-    _run_engine(default, f"A) SttEngine (путь приложения, backend={default.stt_backend})")
+    _run_engine(default, f"A) backend (путь приложения, backend={default.stt_backend})")
 
     # B) Прямой вызов той же библиотеки с идентичными параметрами.
     _run_mlx_direct(default, "B) mlx_whisper.transcribe напрямую (те же параметры)")
@@ -151,7 +151,7 @@ def main() -> int:
     # C) Референс: faster-whisper base.en (явно выбранный вариант).
     _run_engine(
         AppConfig(stt_backend="faster-whisper"),
-        "C) SttEngine (референс: faster-whisper base.en)",
+        "C) backend (референс: faster-whisper base.en)",
     )
     return 0
 

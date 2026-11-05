@@ -39,7 +39,8 @@ from companion.config import AppConfig  # noqa: E402
 from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
 from companion.session_controller import SessionController  # noqa: E402
-from tests.stt_fakes import FakeSttEngine  # noqa: E402
+from companion.stt_engine import SttEngine  # noqa: E402
+from tests.stt_fakes import FakeBackend  # noqa: E402
 
 _QAPP: "QApplication | None" = None
 
@@ -78,7 +79,7 @@ def _make_audio(path: str) -> None:
 
 
 class SttWindowTestBase(unittest.TestCase):
-    """Общее окружение: окно + реальный AudioController + FakeSttEngine."""
+    """Общее окружение: окно + реальный AudioController + SttEngine/FakeBackend."""
 
     def setUp(self) -> None:
         _app()
@@ -97,9 +98,8 @@ class SttWindowTestBase(unittest.TestCase):
         self.audio._record_file = self.audio_path
         self.audio._ready_recording = self.audio_path
 
-        self.stt = FakeSttEngine(
-            self.config, result_text="hello there", delay=0.2
-        )
+        self.backend = FakeBackend(result_text="hello there", delay=0.2)
+        self.stt = SttEngine(self.backend)
         self.window = MainWindow(controller, self.audio, self.stt)
         self.window.show()
         _pump(0.1)
@@ -137,7 +137,7 @@ class TestRecognizeFillsInput(SttWindowTestBase):
 class TestEmptyAndErrorKeepInput(SttWindowTestBase):
     def test_empty_result_keeps_existing_text(self) -> None:
         """Пустой результат НЕ стирает введённый текст."""
-        self.stt.result_text = ""
+        self.backend.result_text = ""
         self.window.message_input.setText("my typed sentence")
         self.window.start_recognition()
         _wait_stt_idle(self.stt)
@@ -145,7 +145,7 @@ class TestEmptyAndErrorKeepInput(SttWindowTestBase):
 
     def test_error_keeps_existing_text(self) -> None:
         """Ошибка НЕ стирает введённый текст и показывает сообщение."""
-        self.stt.raise_on_transcribe = RuntimeError("boom")
+        self.backend.raise_on_transcribe = RuntimeError("boom")
         self.window.message_input.setText("my typed sentence")
         self.window.start_recognition()
         _wait_stt_idle(self.stt)
@@ -252,7 +252,7 @@ class TestMicCombo(unittest.TestCase):
         self.config = AppConfig()
         self.audio = AudioController()
         controller = SessionController(OllamaClient(self.config))
-        self.stt = FakeSttEngine(self.config, result_text="x")
+        self.stt = SttEngine(FakeBackend(result_text="x"))
         self.w = MainWindow(controller, self.audio, self.stt)
         self.w.show()
         _pump(0.1)

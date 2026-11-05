@@ -96,18 +96,17 @@ def _make_transcriber(model_key: str):
 
     if model_key == "base":
         from companion.config import AppConfig
-        from companion.stt_engine import SttEngine
+        from companion.stt_backends import FasterWhisperBackend
 
         # Явно faster-whisper: дефолт AppConfig — уже mlx-бэкенд.
-        eng = SttEngine(AppConfig(stt_backend="faster-whisper"))
+        backend = FasterWhisperBackend(AppConfig(stt_backend="faster-whisper"))
         t0 = time.perf_counter()
-        eng._ensure_model()
+        model = backend.load_model()
         load_s = time.perf_counter() - t0
-        model = eng._ensure_model()
 
         def transcribe(path: str) -> str:
             with quiet:
-                return eng._run_transcribe(model, path).strip()
+                return backend.transcribe(model, path).strip()
         return load_s, transcribe
 
     # MLX: ModelHolder кэширует модель по пути → отдельный замер загрузки и

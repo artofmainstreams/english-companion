@@ -1,21 +1,22 @@
 """Локальное распознавание речи (Whisper).
 
-Бэкенд выбирается в ``AppConfig.stt_backend``:
-  * ``"mlx"`` (по умолчанию) — mlx-whisper на Apple Silicon;
-  * ``"faster-whisper"`` — альтернатива, явно выбираемая.
+``SttEngine`` управляет фоновой работой и жизненным циклом: фоновый поток,
+сигналы в Qt, ленивая загрузка и переиспользование модели, блокировка
+повторного запуска, общий sync/async затвор (не больше одного
+распознавания одновременно), идемпотентный ``shutdown`` и отложенное
+закрытие окна. Конкретные библиотеки живут в backend'е
+(см. :mod:`companion.stt_backends`): движок знает только минимальный
+контракт ``SttBackend`` (загрузка модели + распознавание файла) и не знает,
+mlx-whisper это или faster-whisper.
 
-Автоматического fallback между бэкендами нет: неизвестный бэкенд или
-отсутствующие зависимости — понятная ошибка, а не тихая смена движка.
+Реализация backend'а выбирается при сборке приложения (``main.py`` →
+``build_backend(config)``). Автоматического fallback нет: неизвестный
+бэкенд или отсутствующие зависимости — понятная ошибка, а не тихая смена
+движка.
 
-Компонент отделён от интерфейса: ``recognize()`` запускает фоновый поток, в
-котором лениво (один раз) грузится и переиспользуется модель, а само
-распознавание выполняется вне UI-потока. Результат возвращается в поток Qt
-через сигналы.
-
-Тяжёлые вызовы вынесены в ``_load_model``/``_load_mlx_model``/
-``_load_whisper_model`` и ``_run_transcribe``: обычные тесты подменяют их
-(или наследуют класс) и не касаются ни микрофона, ни интернета, ни
-скачивания весов.
+Оркестрация проверяется с подменным backend'ом (``tests/stt_fakes.py``):
+без микрофона, интернета и скачивания весов, и без наследования ради
+подмены приватных методов.
 """
 
 import logging
@@ -24,17 +25,13 @@ import threading
 
 from PySide6.QtCore import QObject, Signal
 
-from .config import AppConfig
+from .stt_backends import SttBackend
 
 logger = logging.getLogger(__name__)
 
 
 class SttEngine(QObject):
     """Распознаёт речь локально и безопасно относительно UI-потока."""
-
-    # Поддерживаемые бэкенды. Других нет — это же сообщение попадёт в
-    # ошибку при некорректном ``stt_backend``.
-    SUPPORTED_BACKENDS = ("mlx", "faster-whisper")
 
     state_changed = Signal()
     recognized = Signal(str)
@@ -44,9 +41,9 @@ class SttEngine(QObject):
     LOADING = "loading"
     TRANSCRIBING = "transcribing"
 
-    def __init__(self, config: AppConfig, parent: QObject | None = None) -> None:
+    def __init__(self, backend: SttBackend, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self.config = config
+        self.backend = backend
         self.state = self.IDLE
         self.status = "Распознавание: готов"
 
@@ -205,137 +202,19 @@ class SttEngine(QObject):
         """Загрузка модели + распознавание. Вызывается ПОСЛЕ успешного ``_claim``.
 
         Тяжёлые вызовы выполняются БЕЗ удержания ``_state_lock`` (блокировка
-        состояния захватывается только короткими обновлениями состояния).
+        состояния захватывается только короткими обновлениями состояния);
+        сами тяжёлые вызовы (загрузка модели, распознавание) делает backend.
         """
         model = self._ensure_model()
         self._set_state(self.TRANSCRIBING, "Распознаю речь…")
-        return self._run_transcribe(model, audio_path).strip()
+        return self.backend.transcribe(model, audio_path).strip()
 
     def _ensure_model(self):
         """Возвращает модель, загрузив её лениво (один раз)."""
         with self._model_lock:
             if self._model is None:
-                self._model = self._load_model()
+                self._model = self.backend.load_model()
             return self._model
-
-    # --- Точки подмены для тестов ------------------------------------------
-
-    def _pick_backend_loader(self):
-        """Возвращает функцию создания модели выбранного бэкенда.
-
-        Без fallback: неизвестный бэкенд — явная ошибка. Этот шаг обязателен
-        и для подмен в тестах: фейк наследует проверку конфига.
-        """
-        backend = self.config.stt_backend
-        if backend == "mlx":
-            return self._load_mlx_model
-        if backend == "faster-whisper":
-            return self._load_whisper_model
-        raise ValueError(
-            f"Неизвестный STT-бэкенд: {backend!r}. "
-            f"Выберите один из: {', '.join(self.SUPPORTED_BACKENDS)}."
-        )
-
-    def _load_model(self):
-        """Создаёт модель выбранного бэкенда (точка подмены в тестах)."""
-        return self._pick_backend_loader()()
-
-    def _run_transcribe(self, model, audio_path: str) -> str:
-        """Распознаёт файл бэкендом из конфига. Выполняется в рабочем потоке.
-
-        Точка подмены в тестах. ``model`` — результат ``_load_model``
-        (у faster-whisper имитируется и переиспользуется напрямую; у MLX
-        модель уже кэширована в ModelHolder, см. ``_run_transcribe_mlx``).
-        """
-        if self.config.stt_backend == "mlx":
-            return self._run_transcribe_mlx(model, audio_path)
-        return self._run_transcribe_whisper(model, audio_path)
-
-    # --- MLX (mlx-whisper) --------------------------------------------------
-
-    @staticmethod
-    def _require_mlx_imports() -> None:
-        """Гарантирует наличие зависимостей MLX.
-
-        При отсутствии — понятная ошибка с подсказкой по установке
-        (без тихого перехода на другой бэкенд).
-        """
-        try:
-            import mlx.core  # noqa: F401
-            import mlx_whisper  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "Бэкенд MLX недоступен: не установлены зависимости mlx / "
-                "mlx-whisper. Установка (macOS, arm64): "
-                "python -m pip install '.[mlx]' "
-                "(плюс системный ffmpeg). "
-                "Или выберите stt_backend='faster-whisper' в AppConfig."
-            ) from exc
-
-    def _load_mlx_model(self):
-        """Создаёт MLX-модель (mlx-whisper). Ленивый импорт: без весов.
-
-        ``ModelHolder`` кэширует модель по пути репозитория — повторная
-        загрузка не происходит, ``_run_transcribe_mlx`` переиспользует уже
-        загруженную модель. fp16 — стандартная точность Whisper
-        (не квантизация); веса скачиваются только при первом запуске.
-        """
-        self._require_mlx_imports()
-        import mlx.core as mx
-        from mlx_whisper.transcribe import ModelHolder
-
-        return ModelHolder.get_model(self.config.stt_mlx_model, mx.float16)
-
-    def _run_transcribe_mlx(self, model, audio_path: str) -> str:
-        """Распознаёт файл через mlx-whisper (в рабочем потоке).
-
-        ``language``/``task`` берутся из AppConfig; текста за рамками самой
-        Whisper-модели никаких исправлений не делается. Аудио декодируется
-        системным ffmpeg (mlx-whisper вызывает его подпроцессом).
-        """
-        import mlx_whisper
-
-        result = mlx_whisper.transcribe(
-            audio_path,
-            path_or_hf_repo=self.config.stt_mlx_model,
-            language=self.config.stt_language,
-            task=self.config.stt_task,
-        )
-        text = result.get("text", "") if isinstance(result, dict) else str(result)
-        return (text or "").strip()
-
-    # --- faster-whisper -----------------------------------------------------
-
-    def _load_whisper_model(self):
-        """Создаёт Whisper-модель. Ленивый импорт: без скачивания весов.
-
-        Тесты подменяют этот метод (и ``_run_transcribe``), чтобы не тянуть
-        ни faster-whisper, ни интернет.
-        """
-        from faster_whisper import WhisperModel
-
-        return WhisperModel(
-            self.config.stt_whisper_model,
-            device=self.config.stt_device,
-            compute_type=self.config.stt_compute_type,
-        )
-
-    def _run_transcribe_whisper(self, model, audio_path: str) -> str:
-        """Распознаёт файл faster-whisper. Выполняется в рабочем потоке."""
-        segments, _info = model.transcribe(
-            audio_path,
-            language=self.config.stt_language,
-            task=self.config.stt_task,
-            vad_filter=self.config.stt_vad_filter,
-        )
-        # ``segments`` — ленивый генератор: обход идёт здесь, в рабочем
-        # потоке, и не блокирует UI.
-        parts = []
-        for segment in segments:
-            text = (segment.text or "").strip()
-            if text:
-                parts.append(text)
-        return " ".join(parts).strip()
 
     def _set_state(self, state: str, status: str) -> None:
         with self._state_lock:
