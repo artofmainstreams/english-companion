@@ -34,7 +34,7 @@ faulthandler.enable()
 # offscreen — чтобы тесты не зависели от дисплея; аудио при этом работает.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer, QUrl
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtMultimedia import QMediaDevices, QMediaRecorder
 from PySide6.QtWidgets import QApplication
 
@@ -398,25 +398,66 @@ class TestRecordingError(unittest.TestCase):
         self.assertIn("Запись готова", self.c.status)
 
 
-class TestWarmupCancellation(unittest.TestCase):
-    """Подтверждённый дефект: ошибка/Stop/shutdown обязаны отменять
-    незавершённый lead-in (таймер прогрева + pending-URL), а поздний
-    callback ``_on_warmup_done`` не должен запускать запись поверх
-    остановки/ошибки/новой записи.
+class _FakePlayer:
+    """Заглушка QMediaPlayer: фиксирует вызовы play/stop и состояние,
+    без аудиооборудования. Позволяет проверить, что «Остановить» и ошибка
+    действительно останавливают плеер, и что после этого звук не запускается
+    сам (нет фоновых таймеров/колбэков, дёргающих ``play()``).
+    """
 
-    Проверяется без оборудования: имитируем «идущий lead-in» (pending-URL
-    + запущенный таймер) и убеждаемся, что каждый путь отмены гасит его.
+    def __init__(self) -> None:
+        self.play_calls = 0
+        self.stop_calls = 0
+        self._state = "Stopped"
+
+    def play(self) -> None:
+        self.play_calls += 1
+        self._state = "Playing"
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._state = "Stopped"
+
+    def playbackState(self) -> str:
+        return self._state
+
+    def position(self) -> int:
+        return 0
+
+    def setSource(self, *args) -> None:
+        pass
+
+    def setAudioOutput(self, *args) -> None:
+        pass
+
+    def deleteLater(self) -> None:
+        pass
+
+
+class TestPlaybackLifecycle(unittest.TestCase):
+    """Поведение пользователя при воспроизведении (без аудиооборудования):
+
+    * «Остановить» останавливает плеер и переводит контроллер в IDLE;
+    * ошибка воспроизведения возвращает контроллер в согласованное состояние;
+    * после остановки/ошибки звук не запускается сам;
+    * после ``shutdown`` новые операции (``record()``/``play()``) отклоняются.
+
+    Плеер подменяется ``_FakePlayer``: проверяем взаимодействие контроллера с
+    плеером, а не реальное устройство.
     """
 
     def setUp(self) -> None:
         _app()
         self.c = AudioController()
-        self.tmp = tempfile.mkdtemp(prefix="english-companion-warmtest-")
+        # «Готовая запись», чтобы действия на воспроизведение дошли до логики.
+        self.tmp = tempfile.mkdtemp(prefix="english-companion-playlifecyc-")
         self.rec = os.path.join(self.tmp, "recording_1.m4a")
         with open(self.rec, "wb") as f:
             f.write(b"rec-bytes")
         self.c._temp_dir = self.tmp
         self.c._record_file = self.rec
+        self.player = _FakePlayer()
+        self.c._player = self.player
 
     def tearDown(self) -> None:
         self.c.shutdown()
@@ -425,56 +466,63 @@ class TestWarmupCancellation(unittest.TestCase):
             shutil.rmtree(self.tmp, ignore_errors=True)
         del self.c
 
-    def _begin_lead_in(self) -> None:
-        """Имитация идущего lead-in: pending-URL + запущенный (долгий) таймер."""
-        self.c._pending_real_url = QUrl.fromLocalFile(self.rec)
-        self.c._output_warmed = False
+    def _simulate_playing(self) -> None:
+        """Имитируем «идёт воспроизведение»: состояние PLAYING + плеер играет."""
         self.c.state = self.c.PLAYING
-        self.c._warmup_timer = QTimer()
-        self.c._warmup_timer.setSingleShot(True)
-        self.c._warmup_timer.timeout.connect(self.c._on_warmup_done)
-        # Долгий срок: за время теста сам не сработает, только через отмену.
-        self.c._warmup_timer.start(5000)
+        self.c.status = "Воспроизведение…"
+        self.player.play()
 
-    def test_player_error_cancels_warmup(self) -> None:
-        """Ошибка плеера во время lead-in отменяет прогрев; callback мёртв."""
-        self._begin_lead_in()
-        self.c._player_fail("test error")
-        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
-        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
+    def test_stop_stops_playback(self) -> None:
+        """«Остановить» останавливает плеер и переводит контроллер в IDLE."""
+        self._simulate_playing()
+        self.c.stop_playback()
+        self.assertGreaterEqual(self.player.stop_calls, 1, "stop() не вызван")
+        self.assertEqual(self.player.playbackState(), "Stopped")
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertIn("Голос: готов", self.c.status)
+
+    def test_error_returns_consistent_state(self) -> None:
+        """Ошибка воспроизведения возвращает контроллер в согласованное состояние."""
+        self._simulate_playing()
+        self.c._player_fail("не удалось открыть файл")
         self.assertEqual(self.c.state, AudioController.IDLE)
         self.assertIn("Ошибка воспроизведения", self.c.status)
-        # Старый callback не должен «пробудить» запись.
-        self.c._on_warmup_done()
-        self.assertFalse(
-            self.c._output_warmed, "старый callback запустил воспроизведение"
-        )
-        self.assertEqual(self.c.state, AudioController.IDLE)
 
-    def test_stop_playback_cancels_warmup(self) -> None:
-        """«Остановить» во время lead-in отменяет прогрев и pending."""
-        self._begin_lead_in()
+    def test_no_spontaneous_playback_after_stop(self) -> None:
+        """После «Остановить» звук не запускается сам (нет фоновых пусков)."""
+        self._simulate_playing()
         self.c.stop_playback()
-        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
-        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
+        # Пускаем цикл событий: если бы был фоновый таймер/колбэк, дёргающий
+        # play(), play_calls вырос бы выше начального.
+        _pump(0.4)
         self.assertEqual(self.c.state, AudioController.IDLE)
-        self.c._on_warmup_done()
-        self.assertFalse(
-            self.c._output_warmed, "старый callback запустил воспроизведение"
+        self.assertEqual(self.player.playbackState(), "Stopped")
+        self.assertEqual(
+            self.player.play_calls, 1, "play() вызывался повторно сам"
         )
-        self.assertEqual(self.c.state, AudioController.IDLE)
 
-    def test_shutdown_cancels_warmup(self) -> None:
-        """shutdown отменяет lead-in; callback после shutdown мёртв."""
-        self._begin_lead_in()
-        self.c.shutdown()
-        self.assertIsNone(self.c._pending_real_url, "pending-URL не сброшен")
-        self.assertIsNone(self.c._warmup_timer, "таймер прогрева не остановлен")
-        self.c._on_warmup_done()
-        self.assertFalse(
-            self.c._output_warmed, "старый callback запустил воспроизведение"
-        )
+    def test_no_spontaneous_playback_after_error(self) -> None:
+        """После ошибки звук не запускается сам."""
+        self._simulate_playing()
+        self.c._player_fail("сбой")
+        # Пускаем цикл событий: фоновых механизмов, дёргающих play(), нет.
+        _pump(0.4)
         self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertEqual(
+            self.player.play_calls, 1, "play() вызывался сам после ошибки"
+        )
+
+    def test_shutdown_rejects_new_operations(self) -> None:
+        """После ``shutdown`` новые операции (record/play) отклоняются."""
+        self.c.shutdown()
+        _pump(0.1)
+        self.c.record()
+        self.c.play()
+        _pump(0.1)
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertFalse(self.c.can_record, "record() должен быть отклонён")
+        self.assertFalse(self.c.can_play, "play() должен быть отклонён")
+        self.assertTrue(self.c.is_shutdown)
 
 
 class TestAudioPlayback(unittest.TestCase):

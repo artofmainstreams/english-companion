@@ -12,8 +12,9 @@
        сценария пользователя.
 
 Позиция плеера сэмплируется каждые ~25 мс. Логгер контроллера (INFO)
-выдаёт дискретные события: record:stop, record:finalized, record:input-release,
-play:start, play:real-start, warmup:*, mediaStatus, playbackState, player_error.
+выдаёт дискретные события: record:stop-requested, record:finalized,
+record:teardown, play:start, play:stop, mediaStatus, playbackState,
+player_error.
 
 ВАЖНО: этот скрипт показывает МЕХАНИКУ (последовательность, position, ошибки).
 Он НЕ подтверждает слышимость начала — это проверяется только на наушниках
@@ -135,7 +136,8 @@ def scenario(label: str, capture_first: bool) -> None:
     sampler.stop()
     c.stop_playback()
     pump(0.3)
-    print(f"  итог: state={c.state} warmed={c._output_warmed} pending={c._pending_real_url is not None}")
+    playback = c._player.playbackState() if c._player is not None else "N/A"
+    print(f"  итог: state={c.state} playbackState={playback} has_recording={c.has_recording}")
     summarize(sampler.samples)
 
     c.shutdown()
