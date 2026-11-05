@@ -26,7 +26,7 @@ Ollama работает на Windows и доступна через SSH-тунн
 | `companion/stt_engine.py` | Оркестрация STT: фоновый поток, сигналы, ленивая загрузка модели, shutdown |
 | `companion/stt_backends.py` | `SttBackend` (Protocol): MlxBackend, FasterWhisperBackend, `build_backend` |
 | `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language=None`, `task=transcribe`), озвучивание: движок `tts_engine` (**qwen3 по умолчанию** \| say), голос `tts_voice` (резерв), параметры Qwen3 (`tts_qwen3_*`; `tts_qwen3_ref_audio` — из `app_data.py`) |
-| `tests/` · `tools/` · `real_stt_check.py` · `real_tts_check.py` | Тесты (unittest); явная проверка реального распознавания (real_stt_check); явная многоцикловая проверка полного цикла запись→STT→Ollama→Qwen3-TTS→повтор + закрытие во время синтеза (real_tts_check); восстановление референса (tools/install_tts_reference.py); подбор TTS-голоса: Kokoro-82M, Qwen3-TTS VoiceDesign (MLX, отдельное окружение) + образец macOS `say` + понижение высоты (Rubber Band) + сохранность голоса D (VoiceDesign vs reference, Qwen3 Base; выбран p4) |
+| `tests/` · `tools/` · `real_stt_check.py` · `real_tts_check.py` · `real_tts_latency.py` · `real_tts_stream_trial.py` | Тесты (unittest); явная проверка реального распознавания (real_stt_check); явная многоцикловая проверка полного цикла запись→STT→Ollama→Qwen3-TTS→повтор + закрытие во время синтеза (real_tts_check); замер задержки короткого ответа по этапам STT/отправка/Ollama/загрузка TTS/синтез/плеер (real_tts_latency) + пробный стриминг TTS p4: TTFS и разрывы при разных `streaming_interval` (real_tts_stream_trial); восстановление референса (tools/install_tts_reference.py); подбор TTS-голоса: Kokoro-82M, Qwen3-TTS VoiceDesign (MLX, отдельное окружение) + образец macOS `say` + понижение высоты (Rubber Band) + сохранность голоса D (VoiceDesign vs reference, Qwen3 Base; выбран p4) |
 
 ## Инварианты
 
@@ -68,6 +68,8 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests  # шт
 RUN_AUDIO_TESTS=1 QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests  # + реальная запись/воспроизведение
 .venv/bin/python real_stt_check.py [путь/к/записи]                        # реальный STT (отдельная проверка)
 .venv/bin/python real_tts_check.py [--audio ФАЙЛ] [--cycles N]            # реальный полный цикл: STT→Ollama→Qwen3-TTS→повтор→shutdown
+.venv/bin/python real_tts_latency.py                                      # замер задержки короткого ответа по этапам (STT/отправка/Ollama/загрузка TTS/синтез/плеер)
+.venv/bin/python real_tts_stream_trial.py                                 # пробный стриминг TTS (p4): TTFS + разрывы при разных streaming_interval vs «весь WAV»
 .venv/bin/python tools/install_tts_reference.py [исходный WAV]            # восстановить голосовой референс (после переустановки)
 ```
 
