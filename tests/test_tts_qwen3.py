@@ -61,6 +61,12 @@ from companion.tts_qwen3 import (  # noqa: E402
 )
 from companion.tts_synth import TtsSynth  # noqa: E402
 
+try:
+    import sounddevice  # noqa: F401
+    _HAS_SOUNDDEVICE = True
+except Exception:  # pragma: no cover - окружение без PortAudio
+    _HAS_SOUNDDEVICE = False
+
 _QAPP: QApplication | None = None
 
 
@@ -628,6 +634,82 @@ class TestStreamSuccess(StreamingTestBase):
             "повтор запустил синтез",
         )
         self.assertEqual(self.c.tts.last_reply_path, path)
+
+
+class _MultiChunkBase(StreamingTestBase):
+    """4 куска: стартовый буфер (40 мс = 2 куска) закрывается, ПОТОМ ещё 2 —
+    их фасад обязан дописать в очередь вывода, а не отбросить как «занято»."""
+
+    def _make_fake(self) -> StreamFakeSynth:
+        return StreamFakeSynth(chunks=4, chunk_len=480)
+
+
+class TestStreamNoTruncation(_MultiChunkBase):
+    """РЕГРЕССИЯ «обрыв ответа»: активный потоковый вывод — это НАШ собственный
+    PLAYING, и фасад не может считать его «занятостью» (state != IDLE) и не
+    отбрасывать куски ПОСЛЕ старта. Вся речь должна дойти до очереди вывода.
+
+    Раньше ``_on_chunk`` бросал каждый кусок после того, как вывод стал
+    активным (state == PLAYING): игрался только стартовый буфер, ответ
+    обрывался посреди фразы, а «Повторить ответ» мог быть недоступен.
+    """
+
+    def test_all_chunks_written_into_stream_queue(self) -> None:
+        self.c.speak_reply("Hello teacher, nice work today")
+        _pump(0.3)
+        self.assertEqual(len(self.ready_paths), 1, "готовый ответ")
+        sp = self.c.player._stream_player
+        self.assertIsNotNone(sp, "поток не стартовал")
+        # Фэйк-поток не «играет»: очередь копит ВСЁ, что дошло до вывода
+        # (callback ещё не вызывался). Старый баг оставлял здесь 2*480
+        # (стартовый буфер), теряя два последующих куска.
+        queued = sum(int(np.asarray(c).size) for c in list(sp._queue.queue))
+        self.assertEqual(queued, 4 * 480, "куски после старта отброшены")
+        self._drain_stream()
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertTrue(self.c.can_replay)
+
+    def test_full_stream_then_replay(self) -> None:
+        self.c.speak_reply("Hello teacher, nice work today")
+        _pump(0.3)
+        self._drain_stream()
+        self.assertEqual(self.c.state, AudioController.IDLE)
+        self.assertTrue(self.c.can_replay, "после вывода доступен повтор")
+        before = self.fake.stream_calls + self.fake.full_calls
+        self.c.replay_reply()
+        _pump(0.1)
+        self.assertEqual(self.fake_player.play_calls, 1, "повтор не проиграл")
+        self.assertEqual(
+            self.fake.stream_calls + self.fake.full_calls, before,
+            "повтор запустил синтез",
+        )
+
+
+@unittest.skipUnless(_HAS_SOUNDDEVICE, "нет sounddevice/PortAudio")
+class TestStreamStartRequirement(unittest.TestCase):
+    """РЕГРЕССИЯ «нет звука»: ``AudioPlayer._make_stream`` не только создаёт
+    ``sd.InputStream``, но и ЗАПУСКАЕТ его. ``sd.InputStream`` при создании НЕ
+    авто-стартует (``active == False``), и без явного ``start()`` аудио-
+    callback не сработает: ни звука, ни ``drained`` (плеер зависает в PLAYING,
+    «Записать» блокируется). Тест без PortAudio: подменяем ``InputStream``.
+    """
+
+    def test_make_stream_starts_and_passes_callback(self) -> None:
+        _app()
+        fake_stream = mock.Mock(name="sd.InputStream-instance")
+        with mock.patch("sounddevice.InputStream", return_value=fake_stream) as m:
+            player = AudioPlayer()
+            sp = mock.Mock(name="_StreamPlayer")
+            try:
+                player._make_stream(sp, 24000)
+            finally:
+                player.shutdown()
+        m.assert_called_once()
+        # Ключевое: поток запущен (а не только создан).
+        fake_stream.start.assert_called_once_with()
+        # И callback проброшен в поток (иначе звука не будет даже со start()).
+        _, kwargs = m.call_args
+        self.assertIs(kwargs.get("callback"), sp.callback, "callback не проброшен")
 
 
 class TestStreamStop(StreamingTestBase):
