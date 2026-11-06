@@ -377,18 +377,24 @@ class AudioPlayer(QObject):
         self.state_changed.emit()
 
     def _make_stream(self, sp: "_StreamPlayer", sample_rate: int):
-        """Создаёт и ЗАПУСКАЕТ аудио-поток (тестовый шов): ``sounddevice``.
+        """Создаёт и ЗАПУСКАЕТ ПОТОК ВЫХОДА (тестовый шов): ``sounddevice``.
 
         ``sounddevice`` импортируется ЛЕНИВО (внутри), чтобы компонент и
         тесты работали без PortAudio; в тестах метод подменяется фэйком.
-        ВАЖНО: ``sd.InputStream`` при создании НЕ авто-стартует
-        (``active`` False), поэтому callback не вызывается, пока не
-        вызван ``start()`` — без него ни звука, ни ``drained`` (и плеер
-        зависает в PLAYING). Отсюда явный ``start()``.
+
+        ВАЖНО: это ПОТОК ВЫХОДА — ``sd.OutputStream`` (callback пишет звук
+        в колонки). ``sd.InputStream`` — это ВХОД (микрофон): писать в его
+        callback звук некуда, и воспроизведение будет ТИХИМ.
+        ``OutputStream`` при создании также НЕ авто-стартует (``active``
+        False), поэтому callback не вызывается, пока не вызван ``start()`` —
+        без него ни звука, ни ``drained`` (и плеер зависает в PLAYING).
+        Отсюда явный ``start()``.
         """
         import sounddevice as sd  # лениво: ядро не требует PortAudio
 
-        stream = sd.InputStream(
+        # OutputStream, а НЕ InputStream: InputStream — вход (микрофон),
+        # писать в его callback звук некуда → тишина.
+        stream = sd.OutputStream(
             samplerate=sample_rate,
             channels=1,
             dtype="float32",

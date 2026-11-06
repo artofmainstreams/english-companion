@@ -686,29 +686,42 @@ class TestStreamNoTruncation(_MultiChunkBase):
 
 
 @unittest.skipUnless(_HAS_SOUNDDEVICE, "нет sounddevice/PortAudio")
-class TestStreamStartRequirement(unittest.TestCase):
-    """РЕГРЕССИЯ «нет звука»: ``AudioPlayer._make_stream`` не только создаёт
-    ``sd.InputStream``, но и ЗАПУСКАЕТ его. ``sd.InputStream`` при создании НЕ
-    авто-стартует (``active == False``), и без явного ``start()`` аудио-
-    callback не сработает: ни звука, ни ``drained`` (плеер зависает в PLAYING,
-    «Записать» блокируется). Тест без PortAudio: подменяем ``InputStream``.
+class TestStreamOutputPath(unittest.TestCase):
+    """РЕГРЕССИЯ «нет звука авто-озвучивания».
+
+    Два реальных бага, которые тест обязан поймать (проверялось на слух):
+
+    * воспроизведение должно идти ПОТОКОМ ВЫХОДА — ``sd.OutputStream``.
+      ``sd.InputStream`` — это ВХОД (микрофон): писать в его callback звук
+      некуда, и пользователь слышит ТИШИНУ (а «Повторить ответ» — через
+      QMediaPlayer — звучит). Раньше как раз был InputStream.
+    * ``OutputStream`` при создании НЕ авто-стартует (``active == False``):
+      без явного ``start()`` callback не сработает → ни звука, ни ``drained``
+      (плеер зависает в PLAYING, «Записать» блокируется).
+
+    Тест без PortAudio: подменяем ``sounddevice.OutputStream`` и убеждаемся,
+    что ``_make_stream`` именно его вызывает (а не InputStream), запускает и
+    пробрасывает callback.
     """
 
-    def test_make_stream_starts_and_passes_callback(self) -> None:
+    def test_make_stream_uses_output_stream_and_starts_it(self) -> None:
         _app()
-        fake_stream = mock.Mock(name="sd.InputStream-instance")
-        with mock.patch("sounddevice.InputStream", return_value=fake_stream) as m:
+        fake_out = mock.Mock(name="sd.OutputStream-instance")
+        fake_in = mock.Mock(name="sd.InputStream-instance")
+        with mock.patch("sounddevice.OutputStream", return_value=fake_out) as m_out, \
+             mock.patch("sounddevice.InputStream", return_value=fake_in) as m_in:
             player = AudioPlayer()
             sp = mock.Mock(name="_StreamPlayer")
             try:
                 player._make_stream(sp, 24000)
             finally:
                 player.shutdown()
-        m.assert_called_once()
-        # Ключевое: поток запущен (а не только создан).
-        fake_stream.start.assert_called_once_with()
-        # И callback проброшен в поток (иначе звука не будет даже со start()).
-        _, kwargs = m.call_args
+        # Ключевое: это ПОТОК ВЫХОДА, а не вход (микрофон).
+        m_out.assert_called_once()
+        m_in.assert_not_called()
+        # Поток запущен (а не только создан) и callback проброшен.
+        fake_out.start.assert_called_once_with()
+        _, kwargs = m_out.call_args
         self.assertIs(kwargs.get("callback"), sp.callback, "callback не проброшен")
 
 
