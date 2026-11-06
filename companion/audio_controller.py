@@ -85,6 +85,8 @@ def build_tts(config: AppConfig, parent: QObject | None = None) -> QObject:
             instruct=config.tts_qwen3_instruct,
             ref_audio=ref_audio,
             ref_text=ref_text,
+            streaming=config.tts_qwen3_streaming,
+            streaming_interval=config.tts_qwen3_streaming_interval,
             parent=parent,
         )
     raise ValueError(
@@ -136,6 +138,7 @@ class AudioController(QObject):
         tts_voice: str = DEFAULT_VOICE,
         parent: QObject | None = None,
         tts: QObject | None = None,
+        stream_start_buffer_ms: int = 500,
     ) -> None:
         super().__init__(parent)
         self.status = "Голос: готов"
@@ -150,6 +153,17 @@ class AudioController(QObject):
             tts.setParent(self)
         self.tts = tts
 
+        # Стартовый буфер потокового вывода (мс): вывод стартует, когда
+        # накоплено не меньше этого аудио (защита от недочётов на старте).
+        self.stream_start_buffer_ms = int(stream_start_buffer_ms)
+        # Состояние потокового вывода: none → pending → active; off — sticky.
+        self._stream = "none"
+        self._stream_dropped = False
+        self._stream_job = 0
+        self._pending = []
+        self._pending_samples = 0
+        self._pending_sr = 0
+
         # Статус и состояние синхронизируются из компонента, который
         # последний раз подал state_changed.
         self.player.state_changed.connect(self._sync_from_player)
@@ -158,6 +172,10 @@ class AudioController(QObject):
         # Готовый/сбойный синтез — отдельные сигналы: автозапуск и статус.
         self.tts.reply_ready.connect(self._on_reply_ready)
         self.tts.failed.connect(self._on_reply_failed)
+        # Потоковый вывод (есть только у Qwen3TtsSynth): куски речи.
+        chunk_sig = getattr(self.tts, "chunk_ready", None)
+        if chunk_sig is not None:
+            chunk_sig.connect(self._on_chunk)
         self.recorder.devices_changed.connect(self.devices_changed.emit)
 
         # Флаг shutdown фасада: после него он не реагирует на сигналы
@@ -266,22 +284,47 @@ class AudioController(QObject):
         self.player.play(path)
 
     def stop_playback(self) -> None:
-        if self._shutdown:
-            return
-        self.player.stop()
+        """Останавливает текущий вывод и прерывает незавершённый синтез.
 
-    def speak_reply(self, text: str) -> None:
-        """Озвучивает ответ преподавателя (синтез ``say`` → AIFF).
-
-        Синтез — это процесс, пишущий файл: он не занимает микрофон и
-        выход, поэтому запускается независимо от записи. Согласование
-        происходит на шаге ВОСПРОИЗВЕДЕНИЯ: готовый файл автозапускается,
-        только если аудио свободно; иначе ответ сохраняется для
-        ручного ``replay_reply()``. После ``shutdown()`` отклоняется.
+        Поток (речь частями): вывод останавливается, незавершённый синтез
+        отменяется (куски отбрасываются, WAV не пишется). Полный WAV
+        (QMediaPlayer): как раньше (``player.stop``). Последний готовый
+        ответ сохраняется для «Повторить ответ» в обоих случаях.
         """
         if self._shutdown:
             return
-        self.tts.synthesize(text)
+        if self.player.stream_active:
+            self.player.stop_stream()
+        else:
+            self.player.stop()
+        # Незавершённый синтез: прерываем (для say — no-op, когда он уже
+        # завершён и state == IDLE; для стриминга — отбросить куски).
+        self._cancel_tts()
+        self._reset_stream_state()
+
+    def speak_reply(self, text: str) -> None:
+        """Озвучивает ответ преподавателя (синтез → WAV/поток).
+
+        Синтез не занимает микрофон и выход, поэтому запускается независимо
+        от записи. Согласование — на шаге ВОСПРОИЗВЕДЕНИЯ: стриминг стартует
+        только если аудио свободно (иначе куски отбрасываются, а ответ остаётся
+        готовым для ручного ``replay_reply()``). Новый ответ сменяет текущий:
+        активный поток останавливается, незавершённый синтез отменяется.
+        После ``shutdown()`` отклоняется.
+        """
+        if self._shutdown:
+            return
+        # Новый ответ сменяет текущий: остановить вывод, сбросить состояние.
+        if self.player.stream_active:
+            self.player.stop_stream()
+        self._reset_stream_state(drop=True)
+        accepted = self.tts.synthesize(text)
+        if accepted:
+            # Номер задания нужен только для потокового вывода (Qwen3TtsSynth).
+            job_id = getattr(self.tts, "current_job_id", None)
+            if job_id is not None:
+                self._stream_job = job_id
+            self._stream_dropped = False
 
     def replay_reply(self) -> None:
         """Повторяет последний готовый голосовой ответ.
@@ -364,26 +407,110 @@ class AudioController(QObject):
         self.status = self.tts.status
         self.state_changed.emit()
 
-    def _on_reply_ready(self, path: str) -> None:
-        """Синтез завершён успешно: автозапуск, если аудио свободно.
+    def _on_chunk(self, chunk, sample_rate: int, job_id: int) -> None:
+        """Очередной кусок речи (главный поток).
 
-        Согласование с записью и воспроизведением: если аудио занято
-        (RECORDING/PLAYING), файл НЕ запускаем — он остаётся готовым
-        ответом для ручного ``replay_reply()``.
+        Гейты: не наше задание / отброшено / аудио занято → молча отбрасываем.
+        Аудио свободно → накапливаем до стартового буфера, затем стартуем
+        вывод и дальше пишем куски напрямую.
+        """
+        if self._shutdown or self._stream_dropped:
+            return
+        if job_id != self._stream_job:
+            return  # кусок старого/чужого задания
+        if self.state != self.IDLE:
+            # Аудио занято (запись/воспроизведение): вывод не стартуем;
+            # куски отбрасываем — ответ останется готовым для ручного повтора.
+            self._stream_dropped = True
+            return
+        if self._stream == "active":
+            self.player.write_chunk(chunk)
+            return
+        # none/pending — накапливаем до стартового буфера.
+        self._stream = "pending"
+        self._pending_sr = sample_rate
+        self._pending.append(chunk)
+        self._pending_samples += chunk.size
+        if self._pending_samples >= self._buffer_samples(sample_rate):
+            self._begin_stream()
+
+    def _on_reply_ready(self, path: str) -> None:
+        """Синтез завершён: доиграть поток ИЛИ проиграть готовый WAV.
+
+        Поток уже шёл (active) — завершаем (остаток опустится → IDLE);
+        накопил, но не стартовал (pending, короткий ответ) — стартуем с тем,
+        что есть, и завершаем. Стриминг не шёл (полный WAV / fallback /
+        занятость) — классический автозапуск, если аудио свободно, иначе
+        ответ остаётся готовым для ручного ``replay_reply()``.
         """
         if self._shutdown:
             return
-        if self.state == self.IDLE:
-            self.player.play(path)
-            return
-        self.status = (
-            "Ответ готов; аудио занято — нажми «Повторить ответ»."
-        )
-        self.state_changed.emit()
+        if self._stream == "active":
+            self.player.end_stream()
+        elif self._stream == "pending":
+            if self.state == self.IDLE:
+                self._begin_stream()
+                self.player.end_stream()
+            else:
+                self._stream_dropped = True
+        else:
+            if self.state == self.IDLE:
+                self.player.play(path)
+            else:
+                self.status = (
+                    "Ответ готов; аудио занято — нажми «Повторить ответ»."
+                )
+                self.state_changed.emit()
+        self._reset_stream_state()
+        self._stream_dropped = True  # кускам этого задания больше не вестись
 
     def _on_reply_failed(self, reason: str) -> None:
-        """Синтез не удался: понятный статус; текст ответа остаётся в чате."""
+        """Синтез не удался: остановить (частичный) вывод, понятный статус.
+
+        Если звук уже начался (поток активен) — вывод останавливаем, но
+        НЕ запускаем заново. Текст ответа остаётся в чате.
+        """
         if self._shutdown:
             return
+        if self.player.stream_active:
+            self.player.stop_stream()
+        self._reset_stream_state()
+        self._stream_dropped = True
         self.status = f"Не удалось озвучить ответ: {reason}"
         self.state_changed.emit()
+
+    # --- Внутреннее: потоковый вывод ----------------------------------------
+
+    def _buffer_samples(self, sr: int) -> int:
+        """Стартовый буфер в сэмплах (из ``stream_start_buffer_ms``)."""
+        return max(1, int(round(self.stream_start_buffer_ms * sr / 1000.0)))
+
+    def _begin_stream(self) -> None:
+        """Стартует вывод и выгружает накопленные куски (если удалось)."""
+        self.player.start_stream(self._pending_sr)
+        if self.player.state != self.player.PLAYING:
+            # Не вышло (занято/нет устройства) — накопленное не пускаем.
+            self._stream_dropped = True
+            self._pending = []
+            self._pending_samples = 0
+            return
+        self._stream = "active"
+        for ch in self._pending:
+            self.player.write_chunk(ch)
+        self._pending = []
+        self._pending_samples = 0
+
+    def _reset_stream_state(self, drop: bool = False) -> None:
+        """Сбрасывает учёт потокового вывода (для нового ответа/завершения)."""
+        self._stream = "none"
+        self._pending = []
+        self._pending_samples = 0
+        self._pending_sr = 0
+        if drop:
+            self._stream_dropped = True
+
+    def _cancel_tts(self) -> None:
+        """Прерывает незавершённый синтез (если движок умеет ``cancel``)."""
+        cancel = getattr(self.tts, "cancel", None)
+        if callable(cancel):
+            cancel()

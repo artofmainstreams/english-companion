@@ -13,20 +13,20 @@ Ollama работает на Windows и доступна через SSH-тунн
 
 | Путь | Ответственность |
 |---|---|
-| `main.py` | Точка входа: сборка приложения; STT-бэкенд выбирается через `build_backend(config)`; порядок shutdown: сначала STT, потом аудио |
+| `main.py` | Точка входа: сборка приложения; STT-бэкенд выбирается через `build_backend(config)`; фасад получает `stream_start_buffer_ms` из конфига; порядок shutdown: сначала STT, потом аудио |
 | `companion/main_window.py` | Окно: история чата, поле ввода, «Записать/Прослушать/Распознать/Сохранить/Повторить ответ», выбор микрофона; ответ преподавателя озвучивается при добавлении в чат |
 | `companion/session_controller.py` | Сессия чата: история, модель, запросы к Ollama |
 | `companion/ollama_client.py` | REST-клиент Ollama (QNetworkAccessManager) |
-| `companion/audio_controller.py` | Фасад аудио: единое состояние IDLE/RECORDING/PLAYING, взаимное исключение запись↔воспроизведение, озвучивание ответов (`speak_reply`/`replay_reply`), выбор движка TTS `build_tts(config)` (say \| qwen3), порядок shutdown |
+| `companion/audio_controller.py` | Фасад аудио: единое состояние IDLE/RECORDING/PLAYING, взаимное исключение запись↔воспроизведение, озвучивание ответов (`speak_reply`/`replay_reply`), выбор движка TTS `build_tts(config)` (say \| qwen3), **потоковый вывод** (состояние none→pending→active, стартовый буфер `stream_start_buffer_ms`, гейты «не наше задание / занято / отброшено»), порядок shutdown |
 | `companion/audio_recorder.py` | Запись: устройства ввода, сессия, «готовая» запись; владелец временных файлов |
-| `companion/audio_player.py` | Воспроизведение готового аудиофайла; не удаляет переданные файлы |
+| `companion/audio_player.py` | Воспроизведение готового аудиофайла (QMediaPlayer); **потоковый вывод** речь кусками через `sounddevice` (PortAudio) — `start_stream/write_chunk/end_stream/stop_stream`; не удаляет переданные файлы |
 | `companion/tts_synth.py` | Озвучивание ответов: macOS `say` (голос из конфига, текст — через stdin) → временный AIFF; владелец своих временных файлов; сигналы `reply_ready`/`failed`; не проигрывает звук |
-| `companion/tts_qwen3.py` | Озвучивание ответов: Qwen3-TTS (MLX) → временный WAV; фоновый поток (не блокирует UI), ленивая загрузка модели, ленивый импорт mlx-audio; тот же публичный API, что у `TtsSynth`; режимы reference (Base-модель + реплика-референс p4; **по умолчанию**) / voice_design (описание D); отсутствие файла референса — понятная ошибка ДО загрузки модели |
+| `companion/tts_qwen3.py` | Озвучивание ответов: Qwen3-TTS (MLX) → временный WAV; фоновый поток (не блокирует UI), ленивая загрузка модели, ленивый импорт mlx-audio; тот же публичный API, что у `TtsSynth`; режимы reference (Base-модель + реплика-референс p4; **по умолчанию**) / voice_design (описание D); отсутствие файла референса — понятная ошибка ДО загрузки модели; **потоковый синтез** по умолчанию: сигнал `chunk_ready(chunk, sr, job_id)`, полный WAV собирается из тех же кусков, `cancel()`/`current_job_id`, недоступен ДО звука → полный WAV |
 | `companion/app_data.py` | Постоянная папка данных приложения (вне Git/.venv): `app_data_dir()`, `tts_reference_path()` (референс p4) |
 | `companion/stt_engine.py` | Оркестрация STT: фоновый поток, сигналы, ленивая загрузка модели, shutdown |
 | `companion/stt_backends.py` | `SttBackend` (Protocol): MlxBackend, FasterWhisperBackend, `build_backend` |
-| `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language=None`, `task=transcribe`), озвучивание: движок `tts_engine` (**qwen3 по умолчанию** \| say), голос `tts_voice` (резерв), параметры Qwen3 (`tts_qwen3_*`; `tts_qwen3_ref_audio` — из `app_data.py`) |
-| `tests/` · `tools/` · `real_stt_check.py` · `real_tts_check.py` · `real_tts_latency.py` · `real_tts_stream_trial.py` | Тесты (unittest); явная проверка реального распознавания (real_stt_check); явная многоцикловая проверка полного цикла запись→STT→Ollama→Qwen3-TTS→повтор + закрытие во время синтеза (real_tts_check); замер задержки короткого ответа по этапам STT/отправка/Ollama/загрузка TTS/синтез/плеер (real_tts_latency) + пробный стриминг TTS p4: TTFS и разрывы при разных `streaming_interval` (real_tts_stream_trial); восстановление референса (tools/install_tts_reference.py); подбор TTS-голоса: Kokoro-82M, Qwen3-TTS VoiceDesign (MLX, отдельное окружение) + образец macOS `say` + понижение высоты (Rubber Band) + сохранность голоса D (VoiceDesign vs reference, Qwen3 Base; выбран p4) |
+| `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language=None`, `task=transcribe`), озвучивание: движок `tts_engine` (**qwen3 по умолчанию** \| say), голос `tts_voice` (резерв), параметры Qwen3 (`tts_qwen3_*`; `tts_qwen3_ref_audio` — из `app_data.py`), **стриминг**: `tts_qwen3_streaming` (**вкл**), `tts_qwen3_streaming_interval` (0.5 c), `tts_qwen3_start_buffer_ms` (500 мс) |
+| `tests/` · `tools/` · `real_stt_check.py` · `real_tts_check.py` · `real_tts_latency.py` · `real_tts_stream_trial.py` · `real_tts_stream_app.py` | Тесты (unittest, стриминг — фэйк синтеза + фэйк PortAudio, без mlx-audio/PortAudio); явная проверка реального распознавания (real_stt_check); явная многоцикловая проверка полного цикла запись→STT→Ollama→Qwen3-TTS→повтор + закрытие во время синтеза (real_tts_check); замер задержки короткого ответа по этапам (real_tts_latency) + пробный стриминг TTS p4: TTFS и разрывы при разных `streaming_interval` (real_tts_stream_trial); **стриминг в приложении**: стриминг vs «весь WAV» на одинаковых текстах (TTFC/старт вывода/недочёты/RTF), подбор стартового буфера, Stop/замена/закрытие + факт смерти потока, полный голосовой цикл (real_tts_stream_app); восстановление референса (tools/install_tts_reference.py); подбор TTS-голоса: Kokoro-82M, Qwen3-TTS VoiceDesign (MLX, отдельное окружение) + образец macOS `say` + понижение высоты (Rubber Band) + сохранность голоса D (VoiceDesign vs reference, Qwen3 Base; выбран p4) |
 
 ## Инварианты
 
@@ -54,6 +54,14 @@ Ollama работает на Windows и доступна через SSH-тунн
   готовый ответ автозапускается только если аудио свободно, иначе ждёт
   ручного «Повторить ответ». Ошибка синтеза оставляет текст в чате и
   показывает понятный статус.
+- **Потоковый вывод** (по умолчанию у `qwen3`; `say` — весь WAV): речь
+  стартует ПОСЛЕ накопления стартового буфера (`tts_qwen3_start_buffer_ms`),
+  а не сразу на первом куске (защита от недочётов). Стриминг недоступен
+  ДО звука (фэйк без `.stream` / движок не поддерживает / сбой до первого
+  куска) → полный WAV, как раньше. Ошибка ПОСЛЕ начала звука → вывод
+  остановлен + понятный статус, БЕЗ автостарта. Stop/новый ответ отменяют
+  незавершённый синтез (`cancel()`) — отброшенные куски и WAV НЕ
+  публикуются, последний готовый ответ жив для «Повторить ответ».
 - STT определяет язык автоматически (`language=None`) и сохраняет язык
   речи (русский → русский текст, английский → английский); `task=transcribe`;
   без перевода и LLM-исправлений.
@@ -70,6 +78,7 @@ RUN_AUDIO_TESTS=1 QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discove
 .venv/bin/python real_tts_check.py [--audio ФАЙЛ] [--cycles N]            # реальный полный цикл: STT→Ollama→Qwen3-TTS→повтор→shutdown
 .venv/bin/python real_tts_latency.py                                      # замер задержки короткого ответа по этапам (STT/отправка/Ollama/загрузка TTS/синтез/плеер)
 .venv/bin/python real_tts_stream_trial.py                                 # пробный стриминг TTS (p4): TTFS + разрывы при разных streaming_interval vs «весь WAV»
+.venv/bin/python real_tts_stream_app.py                                   # стриминг в приложении: vs «весь WAV» + подбор буфера + Stop/замена/закрытие + голосовой цикл (нужен туннель Ollama)
 .venv/bin/python tools/install_tts_reference.py [исходный WAV]            # восстановить голосовой референс (после переустановки)
 ```
 

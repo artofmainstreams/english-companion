@@ -20,7 +20,11 @@ def main() -> int:
     # Озвучивание ответов: движок TTS из конфига (tts_engine):
     # "qwen3" (по умолчанию; Qwen3-TTS MLX, reference-режим с референсом
     # p4; ленивая загрузка модели в рабочем потоке) или "say" (резерв).
-    audio = AudioController(parent=app, tts=build_tts(config))
+    audio = AudioController(
+        parent=app,
+        tts=build_tts(config),
+        stream_start_buffer_ms=config.tts_qwen3_start_buffer_ms,
+    )
     # Реализация STT выбирается при сборке приложения, а не в движке:
     # неизвестный stt_backend — понятная ошибка здесь, а не при первом
     # распознавании.

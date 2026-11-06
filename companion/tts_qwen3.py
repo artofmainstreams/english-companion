@@ -16,7 +16,14 @@
   не публикуется и частичный файл не появляется);
 * компонент — ЯВНЫЙ ВЛАДЕЛЕЦ своих временных WAV: каталог создаёт при
   первом готовом ответе и удаляет в ``shutdown()``;
-* повтор (``last_reply_path``) — тот же готовый WAV, без нового синтеза.
+* повтор (``last_reply_path``) — тот же готовый WAV, без нового синтеза;
+* потоковый вывод (по умолчанию включён; размер куска ``streaming_interval``
+  в секундах): речь идёт кусками — сигнал ``chunk_ready(chunk, sr, job_id)``;
+  после успеха полный WAV собирается из тех же кусков (повтор — тот же
+  файл). Стриминг недоступен ДО звука → полный WAV (как раньше); ошибка
+  ПОСЛЕ начала звука → фасад останавливает вывод и показывает статус
+  (без автостарта). ``cancel()`` — прервать текущее задание (новый ответ
+  и «Стоп» им пользуются), последний готовый ответ сохраняется.
 
 Два способа синтеза (выбираются в ``AppConfig``; см. ``build_tts``):
 
@@ -77,6 +84,17 @@ DEFAULT_REF_TEXT = (
 _SENTINEL = object()
 
 
+class _StreamingUnavailable(RuntimeError):
+    """Стриминг недоступен (фэйк без ``.stream`` / движок не поддерживает) —
+    уходим на полный WAV ДО начала звука."""
+
+
+def _chunk_audio(item) -> "np.ndarray":
+    """Кусок из итератора синтеза → 1-D float-массив (``.audio`` или ndarray)."""
+    audio = getattr(item, "audio", item)
+    return np.asarray(audio, dtype=np.float32).ravel()
+
+
 def _write_wav(path: str, audio: np.ndarray, sample_rate: int) -> None:
     """Пишет 16-bit PCM WAV; пик ограничен 0.98 (без клиппинга)."""
     audio = np.asarray(audio, dtype=np.float32)
@@ -106,6 +124,8 @@ class Qwen3TtsSynth(QObject):
     reply_ready = Signal(str)
     # Ошибка синтеза; причина — человекочитаемая строка.
     failed = Signal(str)
+    # Потоковый вывод: очередной кусок речи (np.ndarray), частота, задание.
+    chunk_ready = Signal(object, int, int)
 
     IDLE = "idle"
     SYNTHESIZING = "synthesizing"
@@ -117,6 +137,8 @@ class Qwen3TtsSynth(QObject):
         ref_audio: str = "",
         ref_text: str = "",
         synthesizer: "callable | None" = None,
+        streaming: bool = True,
+        streaming_interval: float = 0.5,
         parent: "QObject | None" = None,
     ) -> None:
         super().__init__(parent)
@@ -128,6 +150,10 @@ class Qwen3TtsSynth(QObject):
         self.mode = "reference" if (ref_audio and ref_text) else "voice_design"
         # Тестовая/альтернативная точка синтеза: (text) -> (audio, sample_rate).
         self._synthesizer = synthesizer
+        # Потоковый вывод: речь кусками (chunk_ready). Выключен, или движок/
+        # фэйк без .stream → _StreamingUnavailable → полный WAV (как раньше).
+        self.streaming = bool(streaming)
+        self.streaming_interval = float(streaming_interval)
 
         self.state = self.IDLE
         self.status = "Озвучивание: готов"
@@ -169,6 +195,12 @@ class Qwen3TtsSynth(QObject):
     def is_shutdown(self) -> bool:
         """``True`` после ``shutdown()``: компонент больше не работает."""
         return self._shutdown
+
+    @property
+    def current_job_id(self) -> int:
+        """Номер текущего (самого свежего) задания; фасад гейтит куски по нему."""
+        with self._lock:
+            return self._job_seq
 
     # --- Публичные действия ------------------------------------------------
 
@@ -217,6 +249,22 @@ class Qwen3TtsSynth(QObject):
             self._worker.start()
         self._job_queue.put(job)
         return True
+
+    def cancel(self) -> None:
+        """Прерывает текущее (незавершённое) задание; последний готовый
+        ответ (повтор) сохраняется. Отдельно от ``shutdown()``: компонент
+        остаётся живым. Рабочий поток сам отбросит задание по номеру между
+        кусками — его результат не публикуется, WAV не пишется; «Стоп» и
+        «новый ответ» пользуются им. Идемпотентна.
+        """
+        with self._lock:
+            if self._shutdown:
+                return
+            self._job_seq += 1
+        if self.state == self.SYNTHESIZING:
+            self.state = self.IDLE
+            self.status = "Озвучивание: остановлено"
+            self.state_changed.emit()
 
     def shutdown(self) -> None:
         """Останавливает синтез и удаляет СВОИ временные файлы. Идемпотентна.
@@ -271,6 +319,30 @@ class Qwen3TtsSynth(QObject):
             return
         if self._shutdown:
             return
+
+        # Стриминг выключен — классический путь (весь WAV).
+        if not self.streaming:
+            self._run_full(job_id, text)
+            return
+
+        # Пытаемся открыть поток. Недоступен ДО звука → полный WAV.
+        try:
+            stream, sample_rate = self._open_stream(text)
+        except _StreamingUnavailable as exc:
+            logger.info(
+                "tts-qwen3: job=%d стриминг недоступен: %s", job_id, exc
+            )
+            self._run_full(job_id, text)
+            return
+        except Exception as exc:
+            # Ошибка ДО первого звука — как сбой полного синтеза.
+            self._finish_failed(job_id, str(exc))
+            return
+
+        self._run_stream(job_id, text, stream, sample_rate)
+
+    def _run_full(self, job_id: int, text: str) -> None:
+        """Классический путь: синтез целиком → один WAV."""
         try:
             audio, sample_rate = self._make_audio(text)
         except Exception as exc:
@@ -279,26 +351,72 @@ class Qwen3TtsSynth(QObject):
             return
         self._finish_ready(job_id, audio, sample_rate)
 
+    def _run_stream(self, job_id: int, text: str, stream, sample_rate: int) -> None:
+        """Идём кусками: публикуем ``chunk_ready``, собираем WAV из тех же."""
+        collected: "list[np.ndarray]" = []
+        try:
+            for item in stream:
+                with self._lock:
+                    stale = (job_id != self._job_seq) or self._shutdown
+                if stale:
+                    # Задание сменили/закрытие: куски и WAV не публикуем.
+                    logger.info(
+                        "tts-qwen3: stream job=%d отброшен "
+                        "(заменён/закрытие)", job_id,
+                    )
+                    return
+                chunk = _chunk_audio(item)
+                collected.append(chunk)
+                self._emit_chunk(job_id, chunk, sample_rate)
+        except Exception as exc:
+            with self._lock:
+                stale = (job_id != self._job_seq) or self._shutdown
+            if stale:
+                logger.info(
+                    "tts-qwen3: stream job=%d сбой отброшен "
+                    "(заменён/закрытие)", job_id,
+                )
+                return
+            if not collected:
+                # Звук ещё не начался: полный WAV (fallback).
+                logger.info(
+                    "tts-qwen3: stream job=%d сломался до звука: %s",
+                    job_id, exc,
+                )
+                self._run_full(job_id, text)
+                return
+            # Звук начался: вывод остановит фасад; без перезапуска.
+            self._finish_failed(job_id, str(exc))
+            return
+
+        # Успех: собираем полный WAV из тех же кусков (повтор без повторного
+        # синтеза); публикуем только если задание всё ещё свежее.
+        audio = (
+            np.concatenate(collected)
+            if collected else np.zeros(0, dtype=np.float32)
+        )
+        if not audio.size:
+            self._finish_failed(job_id, "модель вернула пустое аудио")
+            return
+        self._finish_ready(job_id, audio, sample_rate)
+
+    def _emit_chunk(
+        self, job_id: int, chunk: "np.ndarray", sample_rate: int
+    ) -> None:
+        """Кусок → сигнал (доставка в главный поток); устаревшее не гонит."""
+        with self._lock:
+            if job_id != self._job_seq or self._shutdown:
+                return
+        self.chunk_ready.emit(chunk, sample_rate, job_id)
+
     def _make_audio(self, text: str) -> "tuple[np.ndarray, int]":
-        """Синтез одной реплики; (float-массив, частота дискретизации)."""
-        if self.mode == "reference" and not os.path.exists(self.ref_audio):
-            # Понятная ошибка ДО загрузки модели (и до её скачивания):
-            # референс должен быть восстановлен установщиком.
-            raise RuntimeError(
-                "референс голоса не найден: "
-                f"{self.ref_audio or '<пусто>'}. "
-                "Восстанови файл: "
-                ".venv/bin/python tools/install_tts_reference.py "
-                "(подробности — в README)."
-            )
+        """Синтез одной реплики целиком; (float-массив, частота)."""
+        self._precheck_reference()
         if self._synthesizer is not None:
             result = self._synthesizer(text)
             audio, sample_rate = result
             return np.asarray(audio, dtype=np.float32), int(sample_rate)
-        model = self._model
-        if model is None:
-            model = self._load_model()
-            self._model = model
+        model = self._ensure_model()
         sample_rate = int(model.sample_rate)
         if self.mode == "reference":
             results = model.generate(
@@ -316,6 +434,58 @@ class Qwen3TtsSynth(QObject):
         if not audio.size:
             raise RuntimeError("модель вернула пустое аудио")
         return audio, sample_rate
+
+    def _open_stream(self, text: str) -> "tuple[object, int]":
+        """Открывает поток синтеза: (итератор кусков, частота) или исключение.
+
+        Недоступность — ``_StreamingUnavailable`` (фэйк без ``.stream``) —
+        фасад уходит на полный WAV ДО звука. Ошибка ДО звука — любое другое
+        исключение (фасад показывает статус / fallback).
+        """
+        self._precheck_reference()
+        if self._synthesizer is not None:
+            stream = getattr(self._synthesizer, "stream", None)
+            if stream is None:
+                raise _StreamingUnavailable("у синтезатора нет .stream")
+            return stream(text), int(self._synthesizer.sample_rate)
+        model = self._ensure_model()
+        sample_rate = int(model.sample_rate)
+        if self.mode == "reference":
+            it = model.generate(
+                text=text,
+                ref_audio=self.ref_audio,
+                ref_text=self.ref_text,
+                lang_code="english",
+                stream=True,
+                streaming_interval=self.streaming_interval,
+            )
+        else:
+            it = model.generate_voice_design(
+                text=text,
+                instruct=self.instruct,
+                language="English",
+                stream=True,
+                streaming_interval=self.streaming_interval,
+            )
+        return it, sample_rate
+
+    def _precheck_reference(self) -> None:
+        """Референс-режим: файл должен существовать ДО синтеза/загрузки модели
+        (и до её скачивания) — референс восстанавливается установщиком."""
+        if self.mode == "reference" and not os.path.exists(self.ref_audio):
+            raise RuntimeError(
+                "референс голоса не найден: "
+                f"{self.ref_audio or '<пусто>'}. "
+                "Восстанови файл: "
+                ".venv/bin/python tools/install_tts_reference.py "
+                "(подробности — в README)."
+            )
+
+    def _ensure_model(self):
+        """Ленивая загрузка модели (в рабочем потоке); переиспользуется."""
+        if self._model is None:
+            self._model = self._load_model()
+        return self._model
 
     def _load_model(self):
         """Ленивая загрузка (в рабочем потоке): mlx_audio импортируется здесь."""

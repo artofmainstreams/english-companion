@@ -157,6 +157,20 @@ class TtsSynth(QObject):
         process.waitForBytesWritten(5_000)
         return True
 
+    def cancel(self) -> None:
+        """Прерывает текущий (незавершённый) синтез; последний готовый
+        ответ (повтор) сохраняется. Отдельно от ``shutdown()``: компонент
+        остаётся живым. Частичный файл не публикуется. Идемпотентна.
+        """
+        if self._shutdown or self.state != self.SYNTHESIZING:
+            return
+        self._cancel_process()
+        self._drop_file(self._current_path)
+        self._current_path = None
+        self.state = self.IDLE
+        self.status = "Озвучивание: остановлено"
+        self.state_changed.emit()
+
     def shutdown(self) -> None:
         """Останавливает синтез и удаляет СВОИ временные файлы. Идемпотентна.
 
