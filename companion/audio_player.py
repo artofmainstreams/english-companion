@@ -1,4 +1,4 @@
-"""Воспроизведение готового аудиофайла.
+"""Воспроизведение готового аудиофайла и потокового синтеза.
 
 ``AudioPlayer`` владеет ``QMediaPlayer`` и ``QAudioOutput``: ``play(path)``
 воспроизводит любой готовый файл, ``stop()`` — останавливает, ``shutdown()``
@@ -9,16 +9,172 @@
 Плеер НЕ удаляет и не перемещает переданный файл: судьбу файла решает его
 владелец (например, ``AudioRecorder`` удаляет СВОИ временные файлы при
 ``shutdown``; пользовательский файл ему просто не принадлежит).
+
+Потоковый вывод (речь частями) — отдельный путь поверх ``sounddevice``
+(PortAudio): ``QAudioSink`` в этой сборке PySide6 не даёт писать куски
+(нет ``write``/``bufferedAmount``), поэтому речь идёт из очереди
+numpy-кусков в аудио-колбэк PortAudio (тот же механизм, что в проверенном
+прототипе ``real_tts_stream_trial.py``). API: ``start_stream(sr)`` →
+``write_chunk(chunk)`` (раз в приход) → ``end_stream()``; ``stop_stream()``
+— остановка вместе с очередью. Пусто в очереди ДО конца речи — молчание
+(подсчёт недочётов ``stream_underrun_samples``). После ``end_stream()`` и
+опустошения очереди плеер сам переходит в IDLE. Полный WAV и поток взаимно
+исключаются через общее состояние ``IDLE/PLAYING``.
 """
 
 import logging
+import math
 import os
+import queue
+import threading
 import time
 
-from PySide6.QtCore import QObject, QUrl, Signal
+import numpy as np
+
+from PySide6.QtCore import QObject, QUrl, QTimer, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamPlayer:
+    """Потоковое воспроизведение кусков через ``sounddevice`` (PortAudio).
+
+    Отдельный от ``QMediaPlayer`` путь: ``QAudioSink`` в этой сборке PySide6
+    не даёт писать куски, а речь идёт из очереди numpy-кусков в аудио-колбэк
+    PortAudio. Очередь — мост между потоком Qt (куда фасад кладёт куски
+    ``write``) и аудио-потоком PortAudio (``callback`` — его «потребитель»).
+    Пусто в очереди до конца речи — молчание (недочёт, считается); конец
+    речи (``end``) + опустошение очереди — ``drained``, и владелец переводит
+    плеер в IDLE (тумблер ``QTimer``, главный поток).
+    """
+
+    def __init__(
+        self,
+        owner,
+        sample_rate: int,
+        max_duration_s: float = 300.0,
+        out_rate: int | None = None,
+    ) -> None:
+        self._owner = owner
+        # Частота СИНТЕЗА (входящих кусков) и частота ПОТОКА ВЫХОДА.
+        # Если они различаются (например, синтез 24000 Гц, устройство 48000),
+        # каждый кусок ресемплируем в Python, чтобы PortAudio не делал
+        # преобразование частоты сам — на этой машине его SRC искажает речь.
+        self.content_rate = int(sample_rate)
+        self.out_rate = int(out_rate) if out_rate else int(sample_rate)
+        self._queue: "queue.Queue" = queue.Queue()
+        self._ended = False
+        self._drained = False
+        self._underrun = 0
+        self._lock = threading.Lock()
+        self._started = time.monotonic()
+        self.max_duration_s = max_duration_s
+        # Реальный поток создаёт владелец (в тестах — фэйк): у него .stop()
+        # и .close(), и он уже запущен (sd.InputStream стартует при создании).
+        self._stream = owner._make_stream(self, self.out_rate)
+        self._timer = QTimer(owner)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
+
+    # --- Покормить из потока Qt (фада) --------------------------------------
+
+    def write(self, chunk) -> None:
+        """Кладёт кусок в очередь воспроизведения (безопасно из любого потока).
+
+        Кусок приходит на частоте синтеза (``content_rate``); перед выводом
+        приводим его к частоте потока (``out_rate``). Если частоты совпадают
+        (или тестовый шов ставит их равными) — без ресемплинга, как раньше.
+        """
+        arr = np.asarray(chunk, dtype=np.float32).ravel()
+        if self.out_rate != self.content_rate:
+            arr = self._resample(arr, self.content_rate, self.out_rate)
+        self._queue.put(arr)
+
+    @staticmethod
+    def _resample(x: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+        """Ресемплинг ``from_rate`` → ``to_rate`` (линейный, время-инвариантный).
+
+        По кускам (а не по всей фразе целиком): ``resample_poly`` — линейный
+        FIR, поэтому на каждом куске результат совпадает с обработкой целого
+        сигнала (кроме короткого переходного на границе — пренебрежимо).
+        Без SciPy — линейная интерполяция numpy.
+        """
+        if x.size == 0 or from_rate == to_rate:
+            return x
+        try:
+            from scipy.signal import resample_poly
+
+            g = math.gcd(int(from_rate), int(to_rate))
+            up, down = int(to_rate) // g, int(from_rate) // g
+            out = resample_poly(x, up, down)
+            return np.asarray(out, dtype=np.float32)
+        except Exception:  # нет SciPy / сбой — простой fallback
+            n0 = x.size
+            n1 = max(1, int(round(n0 * to_rate / from_rate)))
+            t = np.linspace(0.0, 1.0, n1, endpoint=False)
+            return np.asarray(
+                np.interp(t * (n0 - 1), np.arange(n0), x), dtype=np.float32
+            )
+
+    def end(self) -> None:
+        """Куски больше не придут: после опустошения очереди — конец речи."""
+        self._ended = True
+
+    # --- Аудио-поток PortAudio ---------------------------------------------
+
+    def callback(self, outdata, frames, time_info, status) -> None:
+        """Запрашивает у PortAudio ``frames`` сэмплов (из очереди или молчание)."""
+        n = 0
+        while n < frames:
+            try:
+                chunk = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            take = min(chunk.size, frames - n)
+            outdata[n:n + take, 0] = chunk[:take]
+            if take < chunk.size:  # остаток куска — назад в очередь
+                self._queue.put(chunk[take:])
+            n += take
+        if n < frames:  # недочёт или хвост конца речи — дописываем тишиной
+            outdata[n:, 0] = 0.0
+            if not self._ended:  # конец речи — хвост тишины, НЕ недочёт
+                with self._lock:
+                    self._underrun += (frames - n)
+        if self._ended and self._queue.empty():
+            with self._lock:
+                self._drained = True
+
+    @property
+    def drained(self) -> bool:
+        with self._lock:
+            return self._drained
+
+    @property
+    def underrun(self) -> int:
+        with self._lock:
+            return self._underrun
+
+    # --- Контроль (главный поток) ------------------------------------------
+
+    def _poll(self) -> None:
+        if self._drained:
+            self._timer.stop()
+            self._owner._on_stream_ended(timeout=False)
+            return
+        if time.monotonic() - self._started > self.max_duration_s:
+            self._timer.stop()
+            self._owner._on_stream_ended(timeout=True)
+
+    def stop(self) -> None:
+        """Останавливает поток и таймер (безопасно повторять)."""
+        self._timer.stop()
+        for op in ("stop", "close"):
+            try:
+                getattr(self._stream, op, lambda: None)()
+            except Exception:  # разбор не должен падать из-за PortAudio
+                pass
 
 
 class AudioPlayer(QObject):
@@ -44,6 +200,15 @@ class AudioPlayer(QObject):
         self._player.playingChanged.connect(self._on_player_playing_changed)
         self._player.mediaStatusChanged.connect(self._on_player_media_status)
         self._player.errorOccurred.connect(self._on_player_error)
+
+        # Потоковый вывод (речь частями): активный _StreamPlayer или None.
+        # Полный WAV (QMediaPlayer) и поток взаимно исключаются по state.
+        self._stream_player: "_StreamPlayer | None" = None
+
+        # Частота ПОТОКА ВЫХОДА (None — детектировать устройство в
+        # start_stream). Тестовый шов: поставить значение = частоте синтеза,
+        # чтобы в тестах не заводить PortAudio и не ресемплировать.
+        self.stream_out_rate: int | None = None
 
         # Флаг shutdown: после него плеер не восстанавливается.
         self._shutdown = False
@@ -110,6 +275,73 @@ class AudioPlayer(QObject):
             self.status = "Голос: готов"
             self.state_changed.emit()
 
+    # --- Потоковый вывод (речь частями) -------------------------------------
+
+    @property
+    def stream_active(self) -> bool:
+        """Идёт ли потоковый вывод (речь частями)."""
+        return self._stream_player is not None
+
+    def stream_underrun_samples(self) -> int:
+        """Сколько сэмплов тишины вставлено (недочёты) с начала потока."""
+        sp = self._stream_player
+        return sp.underrun if sp is not None else 0
+
+    def start_stream(self, sample_rate: int) -> None:
+        """Начинает потоковый вывод при заданной частоте дискретизации.
+
+        ``sample_rate`` — частота СИНТЕЗА (входящих кусков). Поток вывода
+        создаётся на частоте УСТРОЙСТВА (``stream_out_rate`` / детект),
+        а входящие куски ресемплируются в Python: так PortAudio не делает
+        преобразование частоты сам, и речь не искажается.
+
+        Применим только из IDLE (взаимное исключение с полным WAV и
+        записью); иначе игнорируется. Куски кладутся ``write_chunk``,
+        конец — ``end_stream``.
+        """
+        if self._shutdown or self.state != self.IDLE:
+            return
+        out_rate = self.stream_out_rate if self.stream_out_rate is not None \
+            else self._detect_out_rate(sample_rate)
+        try:
+            self._stream_player = _StreamPlayer(
+                self, sample_rate, out_rate=out_rate
+            )
+        except Exception as exc:  # нет PortAudio/устройства → не запускаем
+            logger.warning("stream: не удалось открыть поток", exc_info=True)
+            self.status = "Не удалось начать воспроизведение."
+            self.state_changed.emit()
+            return
+        self.state = self.PLAYING
+        self.status = "Воспроизведение…"
+        self._log_event("stream:start", sr=sample_rate, out_sr=out_rate)
+        self.state_changed.emit()
+
+    def write_chunk(self, chunk) -> None:
+        """Кладёт очередной кусок речи в очередь потока (если поток активен)."""
+        sp = self._stream_player
+        if sp is not None:
+            sp.write(chunk)
+
+    def end_stream(self) -> None:
+        """Куски больше не придут: после опустошения очереди — конец речи."""
+        sp = self._stream_player
+        if sp is not None:
+            sp.end()
+
+    def stop_stream(self) -> None:
+        """Останавливает поток и сбрасывает очередь (без ожидания конца)."""
+        if self._stream_player is None:
+            return
+        self._log_event(
+            "stream:stop", underrun=self.stream_underrun_samples()
+        )
+        self._teardown_stream()
+        if self.state == self.PLAYING:
+            self.state = self.IDLE
+            self.status = "Голос: готов"
+            self.state_changed.emit()
+
     def shutdown(self) -> None:
         """Останавливает плеер и разбирает выход. Идемпотентна.
 
@@ -119,6 +351,9 @@ class AudioPlayer(QObject):
         if self._shutdown:
             return
         self._shutdown = True
+
+        # Поток (если шёл): остановка PortAudio + таймера — до всего остального.
+        self._teardown_stream()
 
         # Выход: явное отсоединение от плеера (setAudioOutput(None)) и
         # снятие связей, затем отложенное удаление. Раньше здесь был
@@ -177,6 +412,75 @@ class AudioPlayer(QObject):
                     "Не удалось снять связи выход ↔ плеер", exc_info=True
                 )
         output.deleteLater()
+
+    def _teardown_stream(self) -> None:
+        """Разбирает активный поток (остановка + таймер). Идемпотентно."""
+        sp = self._stream_player
+        self._stream_player = None
+        if sp is not None:
+            sp.stop()
+
+    def _on_stream_ended(self, timeout: bool = False) -> None:
+        """Поток опустел (или тайм-аут): плеер переходит в IDLE (главный поток)."""
+        if self._shutdown:
+            return
+        underrun = self.stream_underrun_samples()
+        self._teardown_stream()
+        self._log_event("stream:ended", timeout=timeout, underrun=underrun)
+        if self.state == self.PLAYING:
+            self.state = self.IDLE
+            self.status = (
+                "Голос: готов"
+                if not timeout
+                else "Воспроизведение: тайм-аут"
+            )
+        self.state_changed.emit()
+
+    def _detect_out_rate(self, fallback: int) -> int:
+        """Частота устройства вывода (``sounddevice``); при сбое — ``fallback``.
+
+        Цель — вести поток на частоте самого устройства, чтобы PortAudio не
+        делал преобразование частоты (24000→48000 на этой машине искажает
+        речь). Если устройство не определяется — играем на частоте синтеза.
+        """
+        try:
+            import sounddevice as sd  # лениво: ядро не требует PortAudio
+
+            idx = sd.default.device[1]
+            if idx is None:
+                return int(fallback)
+            info = sd.query_devices(idx)
+            rate = int(info.get("default_samplerate") or 0)
+            return rate or int(fallback)
+        except Exception:  # нет PortAudio/устройства → без ресемплинга
+            return int(fallback)
+
+    def _make_stream(self, sp: "_StreamPlayer", sample_rate: int):
+        """Создаёт и ЗАПУСКАЕТ ПОТОК ВЫХОДА (тестовый шов): ``sounddevice``.
+
+        ``sounddevice`` импортируется ЛЕНИВО (внутри), чтобы компонент и
+        тесты работали без PortAudio; в тестах метод подменяется фэйком.
+
+        ВАЖНО: это ПОТОК ВЫХОДА — ``sd.OutputStream`` (callback пишет звук
+        в колонки). ``sd.InputStream`` — это ВХОД (микрофон): писать в его
+        callback звук некуда, и воспроизведение будет ТИХИМ.
+        ``OutputStream`` при создании также НЕ авто-стартует (``active``
+        False), поэтому callback не вызывается, пока не вызван ``start()`` —
+        без него ни звука, ни ``drained`` (и плеер зависает в PLAYING).
+        Отсюда явный ``start()``.
+        """
+        import sounddevice as sd  # лениво: ядро не требует PortAudio
+
+        # OutputStream, а НЕ InputStream: InputStream — вход (микрофон),
+        # писать в его callback звук некуда → тишина.
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            callback=sp.callback,
+        )
+        stream.start()  # без этого callback не сработает (active==False)
+        return stream
 
     # --- Обработчики сигналов -----------------------------------------------
 

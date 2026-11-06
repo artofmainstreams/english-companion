@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QApplication
 from companion.config import AppConfig
 from companion.main_window import MainWindow
 from companion.ollama_client import OllamaClient
-from companion.audio_controller import AudioController
+from companion.audio_controller import AudioController, build_tts
 from companion.stt_backends import build_backend
 from companion.stt_engine import SttEngine
 from companion.session_controller import SessionController
@@ -17,7 +17,14 @@ def main() -> int:
     config = AppConfig()
     client = OllamaClient(config, app)
     controller = SessionController(client, app)
-    audio = AudioController(app)
+    # Озвучивание ответов: движок TTS из конфига (tts_engine):
+    # "qwen3" (по умолчанию; Qwen3-TTS MLX, reference-режим с референсом
+    # p4; ленивая загрузка модели в рабочем потоке) или "say" (резерв).
+    audio = AudioController(
+        parent=app,
+        tts=build_tts(config),
+        stream_start_buffer_ms=config.tts_qwen3_start_buffer_ms,
+    )
     # Реализация STT выбирается при сборке приложения, а не в движке:
     # неизвестный stt_backend — понятная ошибка здесь, а не при первом
     # распознавании.
