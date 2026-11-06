@@ -21,7 +21,11 @@ mlx-audio не нужен, модель не грузится, веса не с�
   неизвестный движок — ошибка, ``reference`` без пары «файл + текст» —
   ошибка;
 * отсутствие файла референса: ``failed`` с понятной причиной
-  (проверка ДО загрузки модели — тест работает без mlx-audio).
+  (проверка ДО загрузки модели — тест работает без mlx-audio);
+* кэш референса (reference-режим): два ответа читают референс ОДИН РАЗ
+  (лениво, в рабочем потоке, тем же загрузчиком/частотой mlx-audio; кэш на
+  экземпляре) — проверка на подмене: фэйк модели + фэйковый ``load_audio``
+  (счётчик); тест работает только когда mlx-audio установлен.
 
 Слышимость и качество голоса — ручная проверка (см. README и
 ``tools/qwen3_voice_consistency_check.py``).
@@ -66,6 +70,12 @@ try:
     _HAS_SOUNDDEVICE = True
 except Exception:  # pragma: no cover - окружение без PortAudio
     _HAS_SOUNDDEVICE = False
+
+try:
+    import mlx_audio.utils  # noqa: F401
+    _HAS_MLX_AUDIO = True
+except Exception:  # pragma: no cover - окружение без mlx-audio
+    _HAS_MLX_AUDIO = False
 
 _QAPP: QApplication | None = None
 
@@ -512,6 +522,99 @@ class TestMissingReferenceFile(unittest.TestCase):
             self.assertEqual(synth.state, synth.IDLE)
             # Модель НЕ загружалась (файла нет — проверка до модели):
             self.assertIsNone(synth._model, "модель грузилась без необходимости")
+        finally:
+            synth.shutdown()
+
+
+class _FakeRefModel:
+    """Фэйк модели Qwen3-TTS: ``sample_rate`` + ``generate()`` (полный путь).
+
+    Не грузит веса, не импортирует mlx — только фиксирует, КАКОЙ ``ref_audio``
+    каждый вызов ``generate()`` получает, и возвращает фиксированный кусок.
+    """
+
+    def __init__(self, sample_rate: int = 24000) -> None:
+        self.sample_rate = sample_rate
+        self.generate_calls = 0
+        self.seen_ref_audio: list = []  # ref_audio каждого generate()
+
+    def generate(self, **kwargs):
+        self.generate_calls += 1
+        self.seen_ref_audio.append(kwargs.get("ref_audio"))
+        return [_Chunk(np.full(4800, 0.1, dtype=np.float32))]
+
+
+class _FakeLoadAudio:
+    """Фэйковый загрузчик референса со счётчиком и одним sentinel-массивом.
+
+    Реальный ``mlx_audio.utils.load_audio`` подменяется им: читаем файла
+    «один раз» = один вызов; содержимое (sentinel) не важно — важно, что
+    синтезатор передаёт в ``generate()`` ТОТ САМЫЙ объект.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.sentinel = object()
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.sentinel
+
+
+@unittest.skipUnless(_HAS_MLX_AUDIO, "mlx-audio не установлен (кэш референса)")
+class TestReferenceAudioCache(unittest.TestCase):
+    """РЕГРЕССИЯ «референс перечитывается каждый раз».
+
+    В reference-режиме референс p4 должен читаться ОДИН РАЗ — лениво, в
+    рабочем потоке, тем же загрузчиком и с той же частотой, что использует
+    mlx-audio (``model.sample_rate``), — а дальше переиспользоваться: обе
+    ``generate()`` (два ответа) получают ОДИН И ТОТ ЖЕ массив, кэш привязан
+    к экземпляру синтезатора. Проверка на подмене: фэйк модели + фэйковый
+    ``load_audio`` (счётчик); модель/``ref_text``/параметры голоса/полный
+    WAV не меняются, внутренний кэш ref-codes mlx-audio — под управлением
+    библиотеки (мы его не трогаем).
+    """
+
+    def test_two_replies_read_reference_once(self) -> None:
+        _app()
+        # Файл-заглушка: содержимое не важно (load_audio подменён), но он
+        # ДОЛЖЕН существовать — проверка файла идёт ДО синтеза (precheck).
+        ref_path = os.path.join(
+            tempfile.gettempdir(), "tts_ref_cache_probe.wav"
+        )
+        with open(ref_path, "wb") as f:
+            f.write(b"fake-reference")
+        synth = Qwen3TtsSynth(
+            model_id=DEFAULT_MODEL_REFERENCE,
+            ref_audio=ref_path,
+            ref_text="That was a really good answer.",
+            streaming=False,  # классический путь: полный WAV
+        )
+        try:
+            model = _FakeRefModel(sample_rate=24000)
+            synth._model = model  # ленивая загрузка: фэйк модели (без весов)
+            fake_load = _FakeLoadAudio()
+            ready: list[str] = []
+            failed: list[str] = []
+            synth.reply_ready.connect(ready.append)
+            synth.failed.connect(failed.append)
+            with mock.patch("mlx_audio.utils.load_audio", fake_load):
+                self.assertTrue(synth.synthesize("Hello teacher, nice work"))
+                _pump(0.3)
+                self.assertEqual(len(ready), 1, "первый ответ не готов")
+                self.assertTrue(synth.synthesize("Hello again, well done"))
+                _pump(0.3)
+                self.assertEqual(len(ready), 2, "второй ответ не готов")
+            self.assertEqual(failed, [], "ошибка синтеза")
+            # Ключевое: референс прочитан ОДИН РАЗ (а не дважды).
+            self.assertEqual(fake_load.calls, 1, "референс перечитан")
+            # Обе generate() получили ОДИН И ТОТ ЖЕ массив (каш).
+            self.assertEqual(model.generate_calls, 2, "не два синтеза")
+            self.assertIs(model.seen_ref_audio[0], fake_load.sentinel)
+            self.assertIs(model.seen_ref_audio[1], fake_load.sentinel)
+            self.assertIs(model.seen_ref_audio[0], model.seen_ref_audio[1])
+            # Кэш привязан к экземпляру синтезатора.
+            self.assertIs(synth._ref_audio_array, fake_load.sentinel)
         finally:
             synth.shutdown()
 

@@ -170,6 +170,10 @@ class Qwen3TtsSynth(QObject):
         self._ready_path: str | None = None
         # Ленивая модель (загружается в рабочем потоке один раз).
         self._model = None
+        # Кэш загруженного массива референса p4 (reference-режим): один раз
+        # в рабочем потоке тем же загрузчиком/частотой mlx-audio, дальше
+        # переиспользуется (файл не перечитывается). Привязан к экземпляру.
+        self._ref_audio_array = None
         self._shutdown = False
 
     # --- Свойства для интерфейса ------------------------------------------
@@ -421,7 +425,7 @@ class Qwen3TtsSynth(QObject):
         if self.mode == "reference":
             results = model.generate(
                 text=text,
-                ref_audio=self.ref_audio,
+                ref_audio=self._reference_audio_array(model),
                 ref_text=self.ref_text,
                 lang_code="english",
             )
@@ -453,7 +457,7 @@ class Qwen3TtsSynth(QObject):
         if self.mode == "reference":
             it = model.generate(
                 text=text,
-                ref_audio=self.ref_audio,
+                ref_audio=self._reference_audio_array(model),
                 ref_text=self.ref_text,
                 lang_code="english",
                 stream=True,
@@ -468,6 +472,21 @@ class Qwen3TtsSynth(QObject):
                 streaming_interval=self.streaming_interval,
             )
         return it, sample_rate
+
+    def _reference_audio_array(self, model) -> "object":
+        """Референс p4 как ``mx.array``: грузится лениво в рабочем потоке
+        ОДИН РАЗ тем же загрузчиком и с той же частотой, что использует
+        mlx-audio (``model.sample_rate``), дальше переиспользуется — файл
+        не перечитывается. Кэш привязан к экземпляру синтезатора (поле
+        ``_ref_audio_array``); внутренний кэш ref-codes mlx-audio остаётся
+        под управлением библиотеки."""
+        if self._ref_audio_array is not None:
+            return self._ref_audio_array
+        from mlx_audio.utils import load_audio
+        self._ref_audio_array = load_audio(
+            self.ref_audio, sample_rate=int(model.sample_rate)
+        )
+        return self._ref_audio_array
 
     def _precheck_reference(self) -> None:
         """Референс-режим: файл должен существовать ДО синтеза/загрузки модели
