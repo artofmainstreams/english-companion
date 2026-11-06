@@ -47,13 +47,18 @@ class AppConfig:
     tts_qwen3_ref_audio: str = str(tts_reference_path())
     tts_qwen3_ref_text: str = DEFAULT_REF_TEXT
 
-    # Потоковый вывод (речь частями; Qwen3TtsSynth по умолчанию):
-    # tts_qwen3_streaming — включить (выключено → полный WAV, как раньше);
+    # Потоковый вывод (речь частями через sounddevice/PortAudio):
+    # tts_qwen3_streaming — ВКЛ/ВЫКЛ. Выключено по умолчанию: полный WAV
+    # → QMediaPlayer (CoreAudio) звучит ЧИСТО, а sounddevice/PortAudio на
+    # этой сборке macOS выдаёт «помехи/искажение» (проверено на слух: тот же
+    # клип чистый через QMediaPlayer, с помехами через sounddevice). Стриминг
+    # дают включением True — тогда речь стартует быстрее (меньше TTFC), но
+    # звучит хрипловато; выбор за пользователем.
     # tts_qwen3_streaming_interval — размер куска в секундах (0.5 —
     # проверено: TTFS ~0.7 c, без недочётов; см. real_tts_stream_app.py);
     # tts_qwen3_start_buffer_ms — стартовый буфер (мс) вывода: вывод
     # стартует, когда накоплено не меньше этого аудио (защита от недочётов).
-    tts_qwen3_streaming: bool = True
+    tts_qwen3_streaming: bool = False
     tts_qwen3_streaming_interval: float = 0.5
     tts_qwen3_start_buffer_ms: int = 500
 

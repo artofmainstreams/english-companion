@@ -23,6 +23,7 @@ numpy-кусков в аудио-колбэк PortAudio (тот же механ�
 """
 
 import logging
+import math
 import os
 import queue
 import threading
@@ -48,9 +49,20 @@ class _StreamPlayer:
     плеер в IDLE (тумблер ``QTimer``, главный поток).
     """
 
-    def __init__(self, owner, sample_rate: int, max_duration_s: float = 300.0) -> None:
+    def __init__(
+        self,
+        owner,
+        sample_rate: int,
+        max_duration_s: float = 300.0,
+        out_rate: int | None = None,
+    ) -> None:
         self._owner = owner
-        self.sample_rate = int(sample_rate)
+        # Частота СИНТЕЗА (входящих кусков) и частота ПОТОКА ВЫХОДА.
+        # Если они различаются (например, синтез 24000 Гц, устройство 48000),
+        # каждый кусок ресемплируем в Python, чтобы PortAudio не делал
+        # преобразование частоты сам — на этой машине его SRC искажает речь.
+        self.content_rate = int(sample_rate)
+        self.out_rate = int(out_rate) if out_rate else int(sample_rate)
         self._queue: "queue.Queue" = queue.Queue()
         self._ended = False
         self._drained = False
@@ -60,7 +72,7 @@ class _StreamPlayer:
         self.max_duration_s = max_duration_s
         # Реальный поток создаёт владелец (в тестах — фэйк): у него .stop()
         # и .close(), и он уже запущен (sd.InputStream стартует при создании).
-        self._stream = owner._make_stream(self, self.sample_rate)
+        self._stream = owner._make_stream(self, self.out_rate)
         self._timer = QTimer(owner)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
@@ -69,8 +81,42 @@ class _StreamPlayer:
     # --- Покормить из потока Qt (фада) --------------------------------------
 
     def write(self, chunk) -> None:
-        """Кладёт кусок в очередь воспроизведения (безопасно из любого потока)."""
-        self._queue.put(np.asarray(chunk, dtype=np.float32).ravel())
+        """Кладёт кусок в очередь воспроизведения (безопасно из любого потока).
+
+        Кусок приходит на частоте синтеза (``content_rate``); перед выводом
+        приводим его к частоте потока (``out_rate``). Если частоты совпадают
+        (или тестовый шов ставит их равными) — без ресемплинга, как раньше.
+        """
+        arr = np.asarray(chunk, dtype=np.float32).ravel()
+        if self.out_rate != self.content_rate:
+            arr = self._resample(arr, self.content_rate, self.out_rate)
+        self._queue.put(arr)
+
+    @staticmethod
+    def _resample(x: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+        """Ресемплинг ``from_rate`` → ``to_rate`` (линейный, время-инвариантный).
+
+        По кускам (а не по всей фразе целиком): ``resample_poly`` — линейный
+        FIR, поэтому на каждом куске результат совпадает с обработкой целого
+        сигнала (кроме короткого переходного на границе — пренебрежимо).
+        Без SciPy — линейная интерполяция numpy.
+        """
+        if x.size == 0 or from_rate == to_rate:
+            return x
+        try:
+            from scipy.signal import resample_poly
+
+            g = math.gcd(int(from_rate), int(to_rate))
+            up, down = int(to_rate) // g, int(from_rate) // g
+            out = resample_poly(x, up, down)
+            return np.asarray(out, dtype=np.float32)
+        except Exception:  # нет SciPy / сбой — простой fallback
+            n0 = x.size
+            n1 = max(1, int(round(n0 * to_rate / from_rate)))
+            t = np.linspace(0.0, 1.0, n1, endpoint=False)
+            return np.asarray(
+                np.interp(t * (n0 - 1), np.arange(n0), x), dtype=np.float32
+            )
 
     def end(self) -> None:
         """Куски больше не придут: после опустошения очереди — конец речи."""
@@ -159,6 +205,11 @@ class AudioPlayer(QObject):
         # Полный WAV (QMediaPlayer) и поток взаимно исключаются по state.
         self._stream_player: "_StreamPlayer | None" = None
 
+        # Частота ПОТОКА ВЫХОДА (None — детектировать устройство в
+        # start_stream). Тестовый шов: поставить значение = частоте синтеза,
+        # чтобы в тестах не заводить PortAudio и не ресемплировать.
+        self.stream_out_rate: int | None = None
+
         # Флаг shutdown: после него плеер не восстанавливается.
         self._shutdown = False
 
@@ -239,14 +290,23 @@ class AudioPlayer(QObject):
     def start_stream(self, sample_rate: int) -> None:
         """Начинает потоковый вывод при заданной частоте дискретизации.
 
+        ``sample_rate`` — частота СИНТЕЗА (входящих кусков). Поток вывода
+        создаётся на частоте УСТРОЙСТВА (``stream_out_rate`` / детект),
+        а входящие куски ресемплируются в Python: так PortAudio не делает
+        преобразование частоты сам, и речь не искажается.
+
         Применим только из IDLE (взаимное исключение с полным WAV и
         записью); иначе игнорируется. Куски кладутся ``write_chunk``,
         конец — ``end_stream``.
         """
         if self._shutdown or self.state != self.IDLE:
             return
+        out_rate = self.stream_out_rate if self.stream_out_rate is not None \
+            else self._detect_out_rate(sample_rate)
         try:
-            self._stream_player = _StreamPlayer(self, sample_rate)
+            self._stream_player = _StreamPlayer(
+                self, sample_rate, out_rate=out_rate
+            )
         except Exception as exc:  # нет PortAudio/устройства → не запускаем
             logger.warning("stream: не удалось открыть поток", exc_info=True)
             self.status = "Не удалось начать воспроизведение."
@@ -254,7 +314,7 @@ class AudioPlayer(QObject):
             return
         self.state = self.PLAYING
         self.status = "Воспроизведение…"
-        self._log_event("stream:start", sr=sample_rate)
+        self._log_event("stream:start", sr=sample_rate, out_sr=out_rate)
         self.state_changed.emit()
 
     def write_chunk(self, chunk) -> None:
@@ -375,6 +435,25 @@ class AudioPlayer(QObject):
                 else "Воспроизведение: тайм-аут"
             )
         self.state_changed.emit()
+
+    def _detect_out_rate(self, fallback: int) -> int:
+        """Частота устройства вывода (``sounddevice``); при сбое — ``fallback``.
+
+        Цель — вести поток на частоте самого устройства, чтобы PortAudio не
+        делал преобразование частоты (24000→48000 на этой машине искажает
+        речь). Если устройство не определяется — играем на частоте синтеза.
+        """
+        try:
+            import sounddevice as sd  # лениво: ядро не требует PortAudio
+
+            idx = sd.default.device[1]
+            if idx is None:
+                return int(fallback)
+            info = sd.query_devices(idx)
+            rate = int(info.get("default_samplerate") or 0)
+            return rate or int(fallback)
+        except Exception:  # нет PortAudio/устройства → без ресемплинга
+            return int(fallback)
 
     def _make_stream(self, sp: "_StreamPlayer", sample_rate: int):
         """Создаёт и ЗАПУСКАЕТ ПОТОК ВЫХОДА (тестовый шов): ``sounddevice``.

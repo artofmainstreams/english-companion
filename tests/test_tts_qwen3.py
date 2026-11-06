@@ -51,7 +51,7 @@ from companion.audio_controller import (  # noqa: E402
     AudioController,
     build_tts,
 )
-from companion.audio_player import AudioPlayer  # noqa: E402
+from companion.audio_player import AudioPlayer, _StreamPlayer  # noqa: E402
 from companion.audio_recorder import AudioRecorder  # noqa: E402
 from companion.app_data import tts_reference_path  # noqa: E402
 from companion.config import AppConfig  # noqa: E402
@@ -255,6 +255,9 @@ class StreamingTestBase(Qwen3TtsTestBase):
         # ПортAudio-поток подменяем фэйком (реального звука не будет).
         self.stream_fakes: list[_FakeStream] = []
         self.c.player._make_stream = self._new_stream
+        # Частота вывода = частоте синтеза (24000): ресемплинг тождественный,
+        # существующие проверки счётчиков сэмплов (4*480 и т.п.) остаются.
+        self.c.player.stream_out_rate = 24000
         # Малый стартовый буфер (40 мс): старт после ~2 кусков по 20 мс.
         self.c.stream_start_buffer_ms = 40
 
@@ -583,6 +586,32 @@ class TestBuildTts(unittest.TestCase):
         self.assertEqual(config.tts_qwen3_method, "reference")
         self.assertEqual(config.tts_qwen3_ref_audio, str(tts_reference_path()))
         self.assertTrue(config.tts_qwen3_ref_text)
+        # По умолчанию — ЧИСТОЙ путь (полный WAV / QMediaPlayer), не стриминг.
+        self.assertFalse(
+            config.tts_qwen3_streaming,
+            "по умолчанию стриминг (sounddevice) — на этой сборке хриплый",
+        )
+
+    def test_build_tts_default_uses_clean_path(self) -> None:
+        """РЕГРЕССИЯ «хрип авто-озвучки»: по умолчанию синтезатор НЕ стримит
+        (полный WAV → QMediaPlayer, чистый), а не звук через sounddevice."""
+        tts = build_tts(AppConfig())
+        try:
+            self.assertIsInstance(tts, Qwen3TtsSynth)
+            self.assertFalse(
+                tts.streaming,
+                "по умолчанию стриминг (sounddevice) вместо чистого WAV",
+            )
+        finally:
+            tts.shutdown()
+
+    def test_build_tts_streaming_opt_in(self) -> None:
+        """Стриминг остаётся доступен явно (tts_qwen3_streaming=True)."""
+        tts = build_tts(AppConfig(tts_qwen3_streaming=True))
+        try:
+            self.assertTrue(tts.streaming, "опц. стриминг не включился")
+        finally:
+            tts.shutdown()
 
     def test_reference_mode_without_pair_rejected(self) -> None:
         # reference без пары «файл + текст» — явная ошибка, не смена режима.
@@ -932,6 +961,65 @@ class TestStreamPlayerFake(StreamingTestBase):
         p.start_stream(24000)  # повторный — игнорится (уже PLAYING)
         self.assertEqual(len(self.stream_fakes), 1, "второй поток создан")
         p.stop_stream()
+
+
+class TestStreamResample(StreamingTestBase):
+    """РЕГРЕССИЯ «нет слов, только помехи (как плохой интернет)».
+
+    Корень: PortAudio на этой машине, когда частота ПОТОКА (24000) ≠ частоте
+    УСТРОЙСТВА (48000), делает преобразование частоты сам и искажает речь
+    (слова неразборчивы). На 48000 (ресемплинг в Python) слова разборчивы.
+    Отсюда вывод ведём на частоте устройства, а куски ресемплируем в Python
+    — PortAudio тогда SRC не делает.
+    """
+
+    def test_chunks_resampled_to_device_rate(self) -> None:
+        # Вывод на 48000 (устройство), синтез 24000 → каждый кусок ×2.
+        self.c.player.stream_out_rate = 48000
+        self.c.player.start_stream(24000)
+        sp = self.c.player._stream_player
+        self.assertIsNotNone(sp, "поток не стартовал")
+        self.assertEqual(sp.content_rate, 24000)
+        self.assertEqual(sp.out_rate, 48000)
+        # 480 сэмплов @ 24000 (20 мс) → 960 @ 48000 (длительность та же).
+        self.c.player.write_chunk(np.full(480, 0.5, dtype=np.float32))
+        queued = [np.asarray(c, dtype=np.float32) for c in list(sp._queue.queue)]
+        self.assertEqual(len(queued), 1, "один ресемплированный кусок")
+        self.assertEqual(queued[0].size, 960, "ресемплинг 24000→48000 ×2")
+        self.c.player.stop_stream()
+
+    def test_identity_when_rates_equal(self) -> None:
+        # Частоты равны — без ресемплинга, кусок 1:1 (старые проверки).
+        self.c.player.stream_out_rate = 24000
+        self.c.player.start_stream(24000)
+        sp = self.c.player._stream_player
+        self.assertIsNotNone(sp)
+        self.c.player.write_chunk(np.full(480, 0.5, dtype=np.float32))
+        queued = [np.asarray(c, dtype=np.float32) for c in list(sp._queue.queue)]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].size, 480, "равные частоты — без ×2")
+        self.c.player.stop_stream()
+
+
+class TestResampleHelper(unittest.TestCase):
+    """Ресемплинг ``_StreamPlayer._resample`` (без звука/PortAudio)."""
+
+    def test_identity_same_rate(self) -> None:
+        x = np.arange(10, dtype=np.float32)
+        self.assertTrue(np.array_equal(_StreamPlayer._resample(x, 24000, 24000), x))
+
+    def test_up2_length_and_dtype(self) -> None:
+        x = np.sin(np.linspace(0.0, 2 * np.pi * 5, 480)).astype(np.float32)
+        out = _StreamPlayer._resample(x, 24000, 48000)
+        self.assertEqual(out.dtype, np.float32)
+        self.assertEqual(out.size, 960, "24000→48000 удвоение длины")
+
+    def test_down2_length(self) -> None:
+        out = _StreamPlayer._resample(np.arange(960, dtype=np.float32), 48000, 24000)
+        self.assertEqual(out.size, 480, "48000→24000 вдвое короче")
+
+    def test_empty(self) -> None:
+        self.assertEqual(_StreamPlayer._resample(np.zeros(0, dtype=np.float32), 24000, 48000).size, 0)
 
 
 if __name__ == "__main__":
