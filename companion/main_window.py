@@ -272,53 +272,32 @@ class MainWindow(QMainWindow):
     def _on_stt_recognized(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
-            # Пустой результат: ничего не отправляем, введённый текст не стираем.
+            # Пустой результат: ничего не отправляем.
+            self.status_label.setText("Речь не распознана (пустой результат).")
+            self._update_record_gate()
+            return
+
+        # Голосовой ввод НЕ трогает поле ввода (оно — для ручного текста):
+        # расшифровка уходит либо в чат (отправка), либо в строку статуса.
+        if not self.controller.can_send:
+            # Отправка недоступна: причина и распознанный текст — в статусе.
             self.status_label.setText(
-                "Речь не распознана (пустой результат); введённый текст сохранён."
+                "Отправка недоступна (нет выбранной модели или идёт запрос). "
+                f"Распознанный текст: «{text}»."
             )
             self._update_record_gate()
             return
 
-        draft = self.message_input.text().strip()
-
-        if not self.controller.can_send:
-            # Отправка недоступна: показываем причину и держим расшифровку
-            # для ручной отправки, не затирая уже набранный черновик.
-            self._keep_transcript_unsent(text, draft)
-            self._update_record_gate()
-            return
-
-        # Непустая расшифровка: черновик в поле ввода + автоотправка.
+        # Непустая расшифровка → автоотправка (реплика в чате как обычная).
         # «recognized» срабатывает разово → одна запись даёт одну отправку.
-        if not draft:
-            self.message_input.setText(text)
         if self.controller.send_message(text):
             self.status_label.setText("Отправлено; отвечаю…")
         else:
-            # can_send было True, но отправка не прошла — расшифровка в поле.
-            self._keep_transcript_unsent(text, draft)
+            # can_send было True, но отправка не прошла — причина в статусе.
+            self.status_label.setText(
+                f"Отправка не прошла, повторите. Распознанный текст: «{text}»."
+            )
         self._update_record_gate()
-
-    def _keep_transcript_unsent(self, transcript: str, draft: str) -> None:
-        """Расшифровка распознана, но не отправлена — держим её для вручную.
-
-        Если в поле уже есть ручной черновик — не затираем, показываем
-        расшифровку в строке статуса; если поле пусто — кладём расшифровку
-        в поле ввода, чтобы её можно было отправить кнопкой «Отправить».
-        (Сообщение пишем в основную строку статуса: строка статуса STT
-        принадлежит движку и после распознавания возвращается в «готов».)
-        """
-        reason = "Отправка недоступна (нет выбранной модели или идёт запрос)."
-        if draft:
-            self.status_label.setText(
-                f"{reason} Черновик сохранён; распознанный текст: «{transcript}»."
-            )
-        else:
-            self.message_input.setText(transcript)
-            self.message_input.setFocus()
-            self.status_label.setText(
-                f"{reason} Распознанный текст — в поле ввода."
-            )
 
     def _on_stt_failed(self, message: str) -> None:
         self.stt_status_label.setText(message)

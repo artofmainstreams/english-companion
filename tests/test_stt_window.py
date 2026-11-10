@@ -7,9 +7,10 @@
 Голосовой ввод теперь автоматический: успешное завершение записи (сигнал
 ``recording_completed``) само запускает распознавание, а непустая расшифровка
 сама отправляется через ``SessionController.send_message`` — в чат она
-попадает как обычная реплика пользователя, а в поле ввода остаётся черновик.
-Пустой результат, ошибка или недоступная отправка НЕ отправляют. Пока
-реплика обрабатывается, новая запись блокируется.
+попадает как обычная реплика пользователя. Голосовой ввод НЕ трогает поле
+ввода (оно — для ручного текста): при недоступной отправке причина и текст —
+в строке статуса. Пустой результат, ошибка или недоступная отправка НЕ
+отправляют. Пока реплика обрабатывается, новая запись блокируется.
 
 Подмены (``tests/stt_fakes.py``): без микрофона, интернета и скачивания весов.
 Завершение записи имитируется эмитом ``recording_completed`` (так же, как в
@@ -17,12 +18,12 @@
 отправку офлайн.
 
 Проверяются:
-* успешная запись → авто-STT → непустая расшифровка → автоотправка, черновик
-  остался в поле и реплика появилась в чате;
-* пустой результат / ошибка — ничего не отправлено, введённый текст сохранён;
+* успешная запись → авто-STT → непустая расшифровка → автоотправка (реплика
+  в чате; поле ввода не тронуто);
+* пустой результат / ошибка — ничего не отправлено, поле ввода не тронуто;
 * одна запись — максимум одна отправка (без дублей);
-* отправка недоступна — расшифровка для ручной отправки, ручной черновик не
-  затирается;
+* отправка недоступна — поле ввода не тронуто, причина (и распознанный текст)
+  — в строке статуса;
 * пока идёт распознавание/ожидание ответа — запись заблокирована, после —
   снова доступна;
 * закрытие окна откладывается, пока идёт распознавание, и файл не удаляется
@@ -156,15 +157,15 @@ class TestAutoTriggerAndSend(SttWindowTestBase):
         _wait_stt_idle(self.stt)
         self.assertFalse(self.stt.is_busy)
 
-    def test_success_auto_sends_and_keeps_draft(self) -> None:
-        """Непустая расшифровка: отправлена в чат, черновик остался в поле."""
+    def test_success_auto_sends_field_untouched(self) -> None:
+        """Непустая расшифровка: отправлена в чат, поле ввода НЕ тронуто."""
         send_mock = self._allow_send()
         self.window.message_input.clear()
         self._finish_recording()
         _wait_stt_idle(self.stt)
-        # Черновик остался в поле ввода.
-        self.assertEqual(self.window.message_input.text(), "hello there")
-        # И появилась в чате как обычная реплика пользователя.
+        # Поле ввода НЕ трогается (оно — для ручного текста, не для голоса).
+        self.assertEqual(self.window.message_input.text(), "")
+        # Расшифровка появилась в чате как обычная реплика пользователя.
         self.assertIn("You: hello there", self.window.history.toPlainText())
         # Ровно одна реплика (одна запись — одна отправка).
         self.assertEqual(
@@ -176,13 +177,14 @@ class TestAutoTriggerAndSend(SttWindowTestBase):
 class TestEmptyAndErrorNoSend(SttWindowTestBase):
     """Пустой результат и ошибка НЕ отправляют сообщение."""
 
-    def test_empty_result_no_send_keeps_draft(self) -> None:
-        """Пустая расшифровка: ничего не отправлено, введённый текст сохранён."""
+    def test_empty_result_no_send_field_untouched(self) -> None:
+        """Пустая расшифровка: ничего не отправлено, поле ввода не тронуто."""
         self._allow_send()
         self.backend.result_text = ""
         self.window.message_input.setText("my typed sentence")
         self._finish_recording()
         _wait_stt_idle(self.stt)
+        # Голосовой ввод поле не трогает — набранный текст остался как был.
         self.assertEqual(self.window.message_input.text(), "my typed sentence")
         self.assertEqual(len(self.window.controller.history), 0)
         self.assertNotIn(
@@ -199,8 +201,8 @@ class TestEmptyAndErrorNoSend(SttWindowTestBase):
         self.assertEqual(self.window.message_input.text(), "")
         self.assertEqual(len(self.window.controller.history), 0)
 
-    def test_error_no_send_keeps_draft(self) -> None:
-        """Ошибка распознавания: ничего не отправлено, текст сохранён."""
+    def test_error_no_send_field_untouched(self) -> None:
+        """Ошибка распознавания: ничего не отправлено, поле ввода не тронуто."""
         send_mock = self._allow_send()
         self.backend.raise_on_transcribe = RuntimeError("boom")
         self.window.message_input.setText("my typed sentence")
@@ -241,30 +243,32 @@ class TestNoDuplicates(SttWindowTestBase):
         )
 
 
-class TestManualDraftPreserved(SttWindowTestBase):
-    """Отправка недоступна: расшифровка для вручную, черновик не затирается."""
+class TestFieldNotTouchedByVoice(SttWindowTestBase):
+    """Голосовой ввод не трогает поле ввода (оно — для ручного текста)."""
 
-    def test_send_unavailable_keeps_manual_draft(self) -> None:
-        """Ручной черновик не затирается; расшифровка видна в статусе."""
+    def test_send_unavailable_keeps_manual_text(self) -> None:
+        """Отправка недоступна: набранный текст не затирается, причина в статусе."""
         # can_send False: модель не выбрана (send_chat не трогаем).
         self.assertFalse(self.window.controller.can_send)
         self.window.message_input.setText("my manual draft")
         self._finish_recording()
         _wait_stt_idle(self.stt)
-        # Черновик не затёрт, ничего не отправлено.
+        # Поле не тронуто (голос не затирает ручной текст), ничего не отправлено.
         self.assertEqual(self.window.message_input.text(), "my manual draft")
         self.assertEqual(len(self.window.controller.history), 0)
-        # Расшифровка показана (строка статуса: движок вернул свою строку).
+        # Расшифровка показана в строке статуса (не в поле).
         self.assertIn("hello there", self.window.status_label.text())
 
-    def test_send_unavailable_puts_transcript_in_empty_field(self) -> None:
-        """Пустое поле: расшифровка кладётся в поле для ручной отправки."""
+    def test_send_unavailable_field_stays_empty(self) -> None:
+        """Пустое поле остаётся пустым: расшифровка в него НЕ кладётся."""
         self.assertFalse(self.window.controller.can_send)
         self.window.message_input.clear()
         self._finish_recording()
         _wait_stt_idle(self.stt)
-        self.assertEqual(self.window.message_input.text(), "hello there")
+        self.assertEqual(self.window.message_input.text(), "")
         self.assertEqual(len(self.window.controller.history), 0)
+        # Расшифровка видна в строке статуса, а не в поле ввода.
+        self.assertIn("hello there", self.window.status_label.text())
 
 
 class TestRecordGate(SttWindowTestBase):
