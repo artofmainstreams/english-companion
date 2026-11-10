@@ -128,6 +128,9 @@ class AudioController(QObject):
     # Список устройств ввода изменился (подключение/отключение микрофона):
     # уходит с рекордера, интерфейс перечитывает список.
     devices_changed = Signal()
+    # Успешно завершённая запись (уходит с рекордера): интерфейс по этому
+    # сигналу автоматически запускает распознавание по готовому файлу.
+    recording_completed = Signal(str)
 
     IDLE = "idle"
     RECORDING = "recording"
@@ -177,6 +180,9 @@ class AudioController(QObject):
         if chunk_sig is not None:
             chunk_sig.connect(self._on_chunk)
         self.recorder.devices_changed.connect(self.devices_changed.emit)
+        self.recorder.recording_completed.connect(
+            self.recording_completed.emit
+        )
 
         # Флаг shutdown фасада: после него он не реагирует на сигналы
         # компонентов и не пускает новые операции.
@@ -347,9 +353,6 @@ class AudioController(QObject):
             return
         # Файл принадлежит синтезатору; плеер его не удаляет.
         self.player.play(path)
-
-    def save_last_recording(self, dest_dir: str | None = None) -> str | None:
-        return self.recorder.save_last_recording(dest_dir)
 
     def shutdown(self) -> None:
         """Останавливает запись, воспроизведение и синтез; разбирает слой.

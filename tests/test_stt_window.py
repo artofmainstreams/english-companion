@@ -1,19 +1,30 @@
-"""Интеграционные проверки окна: «Распознать» → поле ввода → закрытие.
+"""Интеграционные проверки окна: авто-STT после записи и автоотправка.
 
 Запуск::
 
     .venv/bin/python -m unittest discover -s tests -v
 
-Используются подмены (``tests/stt_fakes.py``): без микрофона, интернета и
-скачивания веса. Реальный AudioController задаётся «завершённой записью»
-(в тестах допустимо трогать приватное поле; окно использует публичный API).
+Голосовой ввод теперь автоматический: успешное завершение записи (сигнал
+``recording_completed``) само запускает распознавание, а непустая расшифровка
+сама отправляется через ``SessionController.send_message`` — в чат она
+попадает как обычная реплика пользователя, а в поле ввода остаётся черновик.
+Пустой результат, ошибка или недоступная отправка НЕ отправляют. Пока
+реплика обрабатывается, новая запись блокируется.
+
+Подмены (``tests/stt_fakes.py``): без микрофона, интернета и скачивания весов.
+Завершение записи имитируется эмитом ``recording_completed`` (так же, как в
+приложении запускается STT); сетевой вызов Ollama подменяется, чтобы проверить
+отправку офлайн.
 
 Проверяются:
-* успешный результат — текст попадает в поле;
-* пустой результат — введённый текст не стирается;
-* ошибка — введённый текст не стирается, показана ошибка;
-* повторный запуск заблокирован;
-* непустое поле требует подтверждения замены;
+* успешная запись → авто-STT → непустая расшифровка → автоотправка, черновик
+  остался в поле и реплика появилась в чате;
+* пустой результат / ошибка — ничего не отправлено, введённый текст сохранён;
+* одна запись — максимум одна отправка (без дублей);
+* отправка недоступна — расшифровка для ручной отправки, ручной черновик не
+  затирается;
+* пока идёт распознавание/ожидание ответа — запись заблокирована, после —
+  снова доступна;
 * закрытие окна откладывается, пока идёт распознавание, и файл не удаляется
   до завершения работы; после — окно закрывается и файл очищается.
 """
@@ -32,7 +43,7 @@ faulthandler.enable()
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from companion.audio_controller import AudioController  # noqa: E402
 from companion.audio_recorder import AudioRecorder  # noqa: E402
@@ -105,6 +116,22 @@ class SttWindowTestBase(unittest.TestCase):
         self.window.show()
         _pump(0.1)
 
+    def _finish_recording(self) -> None:
+        """Имитируем успешное завершение записи (сигнал → авто-STT).
+
+        В приложении этот сигнал поднимает рекордер по факту завершения; здесь
+        эмитим его, чтобы пройти ту же цепочку ``recording_completed`` → окно →
+        ``stt.recognize`` (одна запись — один запуск).
+        """
+        self.audio.recording_completed.emit(self.audio_path)
+
+    def _allow_send(self):
+        """Делаем отправку доступной: модель выбрана, сетевой вызов подменён."""
+        send_mock = mock.MagicMock(name="send_chat")
+        self.window.controller.client.send_chat = send_mock
+        self.window.controller.selected_model = "m"
+        return send_mock
+
     def tearDown(self) -> None:
         try:
             self.stt.shutdown()
@@ -116,109 +143,164 @@ class SttWindowTestBase(unittest.TestCase):
             del self.window
 
 
-class TestRecognizeFillsInput(SttWindowTestBase):
-    def test_success_fills_empty_input(self) -> None:
-        """Успех: распознанный текст попадает в пустое поле ввода."""
-        self.window.message_input.clear()
-        self.window.start_recognition()
+class TestAutoTriggerAndSend(SttWindowTestBase):
+    """Успешная запись → авто-STT → непустая расшифровка → автоотправка."""
+
+    def test_recording_completed_triggers_stt(self) -> None:
+        """Сигнал завершения записи сам запускает распознавание."""
+        self._allow_send()
+        self.assertFalse(self.stt.is_busy)
+        self._finish_recording()
+        # После эмита STT уже работает (фоновый поток запущен).
+        self.assertTrue(self.stt.is_busy)
         _wait_stt_idle(self.stt)
-        self.assertEqual(self.window.message_input.text(), "hello there")
-        # Ничего не отправлялось в чат автоматически.
-        self.assertEqual(len(self.window.controller.history), 0)
+        self.assertFalse(self.stt.is_busy)
 
-    def test_success_when_input_empty_via_button(self) -> None:
-        """Кнопка «Распознать» вызывает распознавание (путь из публичного API)."""
+    def test_success_auto_sends_and_keeps_draft(self) -> None:
+        """Непустая расшифровка: отправлена в чат, черновик остался в поле."""
+        send_mock = self._allow_send()
         self.window.message_input.clear()
-        self.assertTrue(self.window.recognize_button.isEnabled())
-        self.window.recognize_button.click()
+        self._finish_recording()
         _wait_stt_idle(self.stt)
+        # Черновик остался в поле ввода.
         self.assertEqual(self.window.message_input.text(), "hello there")
+        # И появилась в чате как обычная реплика пользователя.
+        self.assertIn("You: hello there", self.window.history.toPlainText())
+        # Ровно одна реплика (одна запись — одна отправка).
+        self.assertEqual(
+            self.window.history.toPlainText().count("You: hello there"), 1
+        )
+        send_mock.assert_called_once()
 
 
-class TestEmptyAndErrorKeepInput(SttWindowTestBase):
-    def test_empty_result_keeps_existing_text(self) -> None:
-        """Пустой результат НЕ стирает введённый текст."""
+class TestEmptyAndErrorNoSend(SttWindowTestBase):
+    """Пустой результат и ошибка НЕ отправляют сообщение."""
+
+    def test_empty_result_no_send_keeps_draft(self) -> None:
+        """Пустая расшифровка: ничего не отправлено, введённый текст сохранён."""
+        self._allow_send()
         self.backend.result_text = ""
         self.window.message_input.setText("my typed sentence")
-        self.window.start_recognition()
+        self._finish_recording()
         _wait_stt_idle(self.stt)
         self.assertEqual(self.window.message_input.text(), "my typed sentence")
+        self.assertEqual(len(self.window.controller.history), 0)
+        self.assertNotIn(
+            "You: my typed sentence", self.window.history.toPlainText()
+        )
 
-    def test_error_keeps_existing_text(self) -> None:
-        """Ошибка НЕ стирает введённый текст и показывает сообщение."""
+    def test_empty_result_no_send_empty_field(self) -> None:
+        """Пустая расшифровка: пустое поле остаётся пустым, не отправлено."""
+        self._allow_send()
+        self.backend.result_text = ""
+        self.window.message_input.clear()
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        self.assertEqual(self.window.message_input.text(), "")
+        self.assertEqual(len(self.window.controller.history), 0)
+
+    def test_error_no_send_keeps_draft(self) -> None:
+        """Ошибка распознавания: ничего не отправлено, текст сохранён."""
+        send_mock = self._allow_send()
         self.backend.raise_on_transcribe = RuntimeError("boom")
         self.window.message_input.setText("my typed sentence")
-        self.window.start_recognition()
+        self._finish_recording()
         _wait_stt_idle(self.stt)
         self.assertEqual(self.window.message_input.text(), "my typed sentence")
+        self.assertEqual(len(self.window.controller.history), 0)
+        send_mock.assert_not_called()
         self.assertIn("Не удалось распознать", self.window.stt_status_label.text())
 
 
-class TestBusyBlocksRestart(SttWindowTestBase):
-    def test_recognize_button_disabled_while_busy(self) -> None:
-        """Во время распознавания кнопка «Распознать» заблокирована."""
-        self.window.start_recognition()
-        self.assertTrue(self.stt.is_busy)
-        self.assertFalse(self.window.recognize_button.isEnabled())
+class TestNoDuplicates(SttWindowTestBase):
+    """Одна запись → максимум одна отправка; дублей нет."""
 
-    def test_new_recording_blocked_while_busy(self) -> None:
-        """Во время STT новую запись отклоняем."""
-        self.window.start_recognition()
+    def test_one_recording_one_send(self) -> None:
+        """Один эмит сигнала — ровно одна отправка."""
+        send_mock = self._allow_send()
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        send_mock.assert_called_once()
+        self.assertEqual(
+            self.window.history.toPlainText().count("You: hello there"), 1
+        )
+
+    def test_second_recording_while_busy_not_resent(self) -> None:
+        """Пока «думает» первая, вторая запись НЕ создаёт дубль."""
+        send_mock = self._allow_send()
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        # Первая отправка ушла; ответа нет (send_chat подменён) → busy.
+        self.assertTrue(self.window.controller.busy)
+        # Вторая запись: расшифрована, но отправка недоступна (busy).
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        self.assertEqual(send_mock.call_count, 1)
+        self.assertEqual(
+            self.window.history.toPlainText().count("You: hello there"), 1
+        )
+
+
+class TestManualDraftPreserved(SttWindowTestBase):
+    """Отправка недоступна: расшифровка для вручную, черновик не затирается."""
+
+    def test_send_unavailable_keeps_manual_draft(self) -> None:
+        """Ручной черновик не затирается; расшифровка видна в статусе."""
+        # can_send False: модель не выбрана (send_chat не трогаем).
+        self.assertFalse(self.window.controller.can_send)
+        self.window.message_input.setText("my manual draft")
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        # Черновик не затёрт, ничего не отправлено.
+        self.assertEqual(self.window.message_input.text(), "my manual draft")
+        self.assertEqual(len(self.window.controller.history), 0)
+        # Расшифровка показана (строка статуса: движок вернул свою строку).
+        self.assertIn("hello there", self.window.status_label.text())
+
+    def test_send_unavailable_puts_transcript_in_empty_field(self) -> None:
+        """Пустое поле: расшифровка кладётся в поле для ручной отправки."""
+        self.assertFalse(self.window.controller.can_send)
+        self.window.message_input.clear()
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        self.assertEqual(self.window.message_input.text(), "hello there")
+        self.assertEqual(len(self.window.controller.history), 0)
+
+
+class TestRecordGate(SttWindowTestBase):
+    """Пока реплика обрабатывается, новая запись заблокирована."""
+
+    def test_record_blocked_while_stt_busy(self) -> None:
+        """Во время распознавания запись недоступна."""
+        self._finish_recording()
         self.assertTrue(self.stt.is_busy)
         self.assertFalse(self.window.record_button.isEnabled())
-        # И защита в обработчике: toggle_record не должен начать запись.
-        self.window.toggle_record()
-        _pump(0.1)
-        self.assertEqual(self.audio.state, AudioController.IDLE)
         _wait_stt_idle(self.stt)
 
-    def test_recognize_button_reenabled_after_idle(self) -> None:
-        """После завершения STT кнопка снова доступна (запись есть)."""
-        self.window.start_recognition()
+    def test_record_blocked_while_controller_busy(self) -> None:
+        """Во время ожидания ответа запись недоступна."""
+        self._allow_send()
+        self._finish_recording()
         _wait_stt_idle(self.stt)
-        self.assertTrue(self.stt.state == self.stt.IDLE)
-        self.assertTrue(self.window.recognize_button.isEnabled())
+        self.assertTrue(self.window.controller.busy)
+        self.assertFalse(self.window.record_button.isEnabled())
 
-
-class TestReplacementConfirmation(SttWindowTestBase):
-    def test_nonempty_input_replaced_on_yes(self) -> None:
-        """Непустое поле: подтверждение «Да» → текст заменён."""
-        self.window.message_input.setText("existing text")
-        with mock.patch.object(
-            QMessageBox, "question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ) as m:
-            self.window.start_recognition()
-            _wait_stt_idle(self.stt)
-            m.assert_called_once()
-        self.assertEqual(self.window.message_input.text(), "hello there")
-
-    def test_nonempty_input_kept_on_no(self) -> None:
-        """Непустое поле: подтверждение «Нет» → текст сохранён."""
-        self.window.message_input.setText("existing text")
-        with mock.patch.object(
-            QMessageBox, "question",
-            return_value=QMessageBox.StandardButton.No,
-        ) as m:
-            self.window.start_recognition()
-            _wait_stt_idle(self.stt)
-            m.assert_called_once()
-        self.assertEqual(self.window.message_input.text(), "existing text")
-
-    def test_empty_input_no_confirmation(self) -> None:
-        """Пустое поле: подтверждение не запрашивается, текст просто вставлен."""
-        self.window.message_input.clear()
-        with mock.patch.object(QMessageBox, "question") as m:
-            self.window.start_recognition()
-            _wait_stt_idle(self.stt)
-            m.assert_not_called()
-        self.assertEqual(self.window.message_input.text(), "hello there")
+    def test_record_enabled_when_idle(self) -> None:
+        """После завершения (без ожидания ответа) запись снова доступна."""
+        # can_send False → отправки нет → controller не busy.
+        self._finish_recording()
+        _wait_stt_idle(self.stt)
+        self.assertFalse(self.window.controller.busy)
+        self.assertFalse(self.stt.is_busy)
+        self.assertTrue(self.window.record_button.isEnabled())
 
 
 class TestCloseHandling(SttWindowTestBase):
+    """Закрытие во время STT отложено; после — окно закрывается, файл очищен."""
+
     def test_close_deferred_during_stt_then_closes(self) -> None:
         """Закрытие во время STT отложено; после завершения окно закрывается."""
-        self.window.start_recognition()
+        self._finish_recording()
         self.assertTrue(self.stt.is_busy)
         # Файл ещё нужен — должен остаться.
         self.assertTrue(os.path.exists(self.audio_path))
