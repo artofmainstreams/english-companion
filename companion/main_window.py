@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 
+from .lesson import Lesson, LessonError, default_lesson_path, load_lesson
 from .session_controller import SessionController
 from .audio_controller import AudioController
 from .stt_engine import SttEngine
@@ -57,6 +59,12 @@ class MainWindow(QMainWindow):
 
         self.refresh_button = QPushButton("Обновить")
 
+        # Выбор урока: показываем name и level («Урок 12 — Elementary»).
+        # Пока доступен один урок (hw12); список растёт добавлением JSON.
+        self.lesson_combo = QComboBox()
+        self.lesson_combo.setMinimumWidth(250)
+        self.new_session_button = QPushButton("Новое занятие")
+
         self.record_button = QPushButton("Записать")
         self.play_button = QPushButton("Прослушать")
         # «Повторить ответ» — повторный проигрыш последней готовой
@@ -82,6 +90,8 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_play)
         self.repeat_button.clicked.connect(self.repeat_reply)
         self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
+        self.new_session_button.clicked.connect(self.on_new_session)
+        self.lesson_combo.currentIndexChanged.connect(self._on_lesson_changed)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(self.message_input)
@@ -101,12 +111,18 @@ class MainWindow(QMainWindow):
         model_layout.addWidget(self.model_combo, 1)
         model_layout.addWidget(self.refresh_button)
 
+        lesson_layout = QHBoxLayout()
+        lesson_layout.addWidget(QLabel("Урок:"))
+        lesson_layout.addWidget(self.lesson_combo, 1)
+        lesson_layout.addWidget(self.new_session_button)
+
         layout = QVBoxLayout()
         layout.addWidget(self.history, 1)
         layout.addLayout(input_layout)
         layout.addLayout(audio_layout)
         layout.addWidget(self.status_label)
         layout.addLayout(model_layout)
+        layout.addLayout(lesson_layout)
 
         container = QWidget()
         container.setLayout(layout)
@@ -126,6 +142,96 @@ class MainWindow(QMainWindow):
         self.render_audio()
         self._refresh_mic_combo()
         self._on_stt_state_changed()
+        self._load_lessons()
+        self._update_session_gate()
+
+    def _load_lessons(self) -> None:
+        """Загружает уроки в комбо («name — level») и выбирает первый.
+
+        Сбой загрузки — понятная ошибка в строке статуса и placeholder
+        комбо; отправка недоступна (``controller.can_send`` False —
+        урока нет).
+        """
+        self.lessons: list[Lesson] = []
+        lesson_error = ""
+        try:
+            self.lessons = [load_lesson(default_lesson_path())]
+        except LessonError as exc:
+            lesson_error = str(exc)
+        with QSignalBlocker(self.lesson_combo):
+            for lesson in self.lessons:
+                self.lesson_combo.addItem(
+                    f"{lesson.name} — {lesson.level}", lesson
+                )
+        if self.lessons:
+            self.controller.set_lesson(self.lessons[0])
+        else:
+            self.lesson_combo.setPlaceholderText("Не удалось загрузить урок")
+        if lesson_error:
+            self.status_label.setText(f"Урок не загрузился: {lesson_error}")
+
+    def _operations_idle(self) -> bool:
+        """Текущие операции завершены: отправка/распознавание/синтез/аудио свободны."""
+        if self.controller.busy:
+            return False
+        if self.stt.is_busy:
+            return False
+        if self.audio.state != self.audio.IDLE:
+            return False
+        if self._tts_synth_busy():
+            return False
+        return True
+
+    def _update_session_gate(self) -> None:
+        """«Новое занятие» и смена урока — только после завершения операций."""
+        has_lessons = self.lesson_combo.count() > 0
+        idle = self._operations_idle()
+        self.new_session_button.setEnabled(has_lessons and idle)
+        self.lesson_combo.setEnabled(has_lessons and idle)
+
+    def on_new_session(self) -> None:
+        """«Новое занятие»: чистая история + выбранный урок.
+
+        Непустая история — сначала подтверждение; отмена — ничего не
+        меняется. Доступно только после завершения текущих операций.
+        """
+        lesson = self.lesson_combo.currentData()
+        if lesson is None or not self._operations_idle():
+            return
+        if self._confirm_new_session("Начать новое занятие с выбранным уроком?"):
+            self._start_new_session(lesson)
+
+    def _on_lesson_changed(self) -> None:
+        """Смена урока = начало нового занятия (с подтверждением при
+        непустой истории); история чата очищается."""
+        lesson = self.lesson_combo.currentData()
+        if lesson is None or lesson is self.controller.lesson:
+            return
+        if not self._operations_idle():
+            return
+        if self._confirm_new_session(
+            f"Сменить урок на «{lesson.name} — {lesson.level}» "
+            "и начать новое занятие?"
+        ):
+            self._start_new_session(lesson)
+
+    def _confirm_new_session(self, question_text: str) -> bool:
+        """Пустая история — подтверждения не требуется; непустая — диалог."""
+        if not self.controller.history:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Новое занятие",
+            f"{question_text}\nИстория разговора будет очищена.",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _start_new_session(self, lesson: Lesson) -> None:
+        self.controller.set_lesson(lesson)
+        self.controller.reset_history()
+        self.history.clear()
+        self.status_label.setText(f"Новое занятие: {lesson.name} · {lesson.level}")
+        self._update_session_gate()
 
     def render_state(self) -> None:
         controller = self.controller
@@ -141,6 +247,7 @@ class MainWindow(QMainWindow):
         self.update_send_button()
         # Ожидание ответа (controller.busy) тоже блокирует запись.
         self._update_record_gate()
+        self._update_session_gate()
 
     def append_message(self, message: Message) -> None:
         speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
@@ -166,6 +273,7 @@ class MainWindow(QMainWindow):
         # _update_record_gate / _can_start_recording): пока голосовая
         # реплика обрабатывается, новая запись запрещена.
         self._update_record_gate()
+        self._update_session_gate()
 
         self.play_button.setEnabled(audio.can_play or playing)
         self.play_button.setText("Стоп" if playing else "Прослушать")

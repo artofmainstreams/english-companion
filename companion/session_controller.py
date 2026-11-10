@@ -1,7 +1,9 @@
 from PySide6.QtCore import QObject, Signal
 
+from .lesson import Lesson
 from .message import Message
 from .ollama_client import OllamaClient
+from .teacher_context import build_teacher_context
 
 
 class SessionController(QObject):
@@ -13,6 +15,9 @@ class SessionController(QObject):
         self.client = client
         self.models: list[str] = []
         self.selected_model = ""
+        # Урок задаёт системный контекст преподавателя (level, темы,
+        # фразы, слова). Без урока отправка недоступна.
+        self.lesson: Lesson | None = None
         # Только успешно завершённые обмены попадают в контекст.
         self.history: list[Message] = []
         self.loading_models = False
@@ -31,7 +36,18 @@ class SessionController(QObject):
 
     @property
     def can_send(self) -> bool:
-        return bool(self.selected_model) and not self.busy
+        return bool(self.selected_model) and self.lesson is not None and not self.busy
+
+    def set_lesson(self, lesson: Lesson) -> None:
+        """Выбранный урок — источник системного контекста преподавателя."""
+        self.lesson = lesson
+        self.state_changed.emit()
+
+    def reset_history(self) -> None:
+        """Новое занятие: история чата очищается (урок остаётся выбран)."""
+        self.history = []
+        self.status = "Готов"
+        self.state_changed.emit()
 
     def load_models(self) -> None:
         if self.busy:
@@ -72,10 +88,20 @@ class SessionController(QObject):
         self.status = f"Думаю · {self._request_model}…"
         self.message_added.emit(self._pending_message)
         self.state_changed.emit()
+        # Системный контекст преподавателя (урок) уходит вместе с
+        # историей, но в чат НЕ попадает — только в запрос к Ollama.
         self.client.send_chat(
-            self._request_model, [*self.history, self._pending_message]
+            self._request_model,
+            [*self.history, self._pending_message],
+            system=self.system_context(),
         )
         return True
+
+    def system_context(self) -> str:
+        """Системный контекст для Ollama; пустая строка, если урока нет."""
+        if self.lesson is None:
+            return ""
+        return build_teacher_context(self.lesson)
 
     def _on_chat_completed(self, text: str) -> None:
         if self._pending_message is None:

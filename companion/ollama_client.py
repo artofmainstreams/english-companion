@@ -69,7 +69,12 @@ class OllamaClient(QObject):
         else:
             self.models_loaded.emit(names)
 
-    def send_chat(self, model: str, messages: list[Message]) -> None:
+    def send_chat(self, model: str, messages: list[Message], system: str = "") -> None:
+        """Отправить чат-запрос.
+
+        ``system`` — системный контекст (например, из урока): уходит в
+        поле ``system`` запроса и НЕ входит в историю сообщений.
+        """
         if self._chat_reply is not None:
             raise RuntimeError("Запрос уже выполняется")
         request = QNetworkRequest(
@@ -87,6 +92,8 @@ class OllamaClient(QObject):
             ],
             "stream": False,
         }
+        if system:
+            payload["system"] = system
         self._chat_reply = self.network.post(
             request, json.dumps(payload, ensure_ascii=False).encode("utf-8")
         )
