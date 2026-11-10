@@ -27,8 +27,8 @@ Ollama работает на Windows и доступна через SSH-тунн
 | `companion/tts_qwen3.py` | Озвучивание ответов: Qwen3-TTS (MLX) → временный WAV; фоновый поток (не блокирует UI), ленивая загрузка модели, ленивый импорт mlx-audio; тот же публичный API, что у `TtsSynth`; режимы reference (Base-модель + реплика-референс p4; **по умолчанию**; референс загружается ОДИН РАЗ — лениво в рабочем потоке тем же загрузчиком/частотой mlx-audio, кэш на экземпляре, переиспользуется, файл не перечитывается) / voice_design (описание D); отсутствие файла референса — понятная ошибка ДО загрузки модели; **по умолчанию полный WAV** (чисто через QMediaPlayer/CoreAudio); **стриминг опционально** (`tts_qwen3_streaming=True`): сигнал `chunk_ready(chunk, sr, job_id)`, полный WAV собирается из тех же кусков, `cancel()`/`current_job_id`, недоступен ДО звука → полный WAV |
 | `companion/app_data.py` | Постоянная папка данных приложения (вне Git/.venv): `app_data_dir()`, `tts_reference_path()` (референс p4) |
 | `companion/stt_engine.py` | Оркестрация STT: фоновый поток, сигналы, ленивая загрузка модели, shutdown |
-| `companion/stt_backends.py` | `SttBackend` (Protocol): MlxBackend, FasterWhisperBackend, `build_backend` |
-| `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language=None`, `task=transcribe`), озвучивание: движок `tts_engine` (**qwen3 по умолчанию** \| say), голос `tts_voice` (резерв), параметры Qwen3 (`tts_qwen3_*`; `tts_qwen3_ref_audio` — из `app_data.py`), **стриминг**: `tts_qwen3_streaming` (**выкл** по умолчанию — полный WAV/QMediaPlayer чистый; вкл → sounddevice, быстрее старт но хриплый), `tts_qwen3_streaming_interval` (0.5 c), `tts_qwen3_start_buffer_ms` (500 мс) |
+| `companion/stt_backends.py` | `SttBackend` (Protocol): MlxBackend, FasterWhisperBackend, `build_backend`; `language`/`task` передаются в библиотеку АС-ЕСТЬ из AppConfig (дефолт — `en`/`transcribe`, занятие рассчитано на английскую речь), без подмены и без перевода |
+| `companion/config.py` | `AppConfig`: адрес Ollama, STT (бэкенд, модель, `language="en"` по умолчанию — занятие рассчитано на английскую речь, `None` — явное автоопределение; `task=transcribe`), озвучивание: движок `tts_engine` (**qwen3 по умолчанию** \| say), голос `tts_voice` (резерв), параметры Qwen3 (`tts_qwen3_*`; `tts_qwen3_ref_audio` — из `app_data.py`), **стриминг**: `tts_qwen3_streaming` (**выкл** по умолчанию — полный WAV/QMediaPlayer чистый; вкл → sounddevice, быстрее старт но хриплый), `tts_qwen3_streaming_interval` (0.5 c), `tts_qwen3_start_buffer_ms` (500 мс) |
 | `companion/lesson.py` | Загрузка и валидация урока из JSON (по умолчанию `lessons/homework12.json`, `default_lesson_path()`). Согласованный формат: `id` (непустая строка), `level` (Elementary \| Pre-Intermediate \| Intermediate \| Advanced), `name` (непустая строка, напр. «Урок 12»), `topics` (темы/конструкции, хотя бы одна), `phrases` и `words` — списки строк (могут быть пустыми); понятный `LessonError` (ВСЕ проблемы сразу, с именами полей), неизвестные поля — ошибка |
 | `lessons/homework12.json` | «Урок 12» (id `hw12`, `Elementary`) по исходнику `raw/homework12_online.doc` (только локально, в Git НЕ попадает, см. `.gitignore`): темы и конструкции (вежливые Can/Could, Present Simple/Continuous, Past Simple, can/could, превосходная степень, местоположение), 30 английских фраз (исправлены опечатки: «Smocking» → «Smoking or non-smoking?», кириллическое «Сan» → «Can»), слова и устойчивые сочетания из материала урока |
 | `tests/` · `tools/` · `real_stt_check.py` · `real_tts_check.py` · `real_tts_latency.py` · `real_tts_stream_trial.py` · `real_tts_stream_app.py` · `crash_probe.py` | Тесты (unittest, стриминг — фэйк синтеза + фэйк PortAudio, без mlx-audio/PortAudio); явная проверка реального распознавания (real_stt_check); явная многоцикловая проверка полного цикла запись→STT→Ollama→Qwen3-TTS→повтор + закрытие во время синтеза (real_tts_check); замер задержки короткого ответа по этапам (real_tts_latency) + пробный стриминг TTS p4: TTFS и разрывы при разных `streaming_interval` (real_tts_stream_trial); **стриминг в приложении**: стриминг vs «весь WAV» на одинаковых текстах (TTFC/старт вывода/недочёты/RTF), подбор стартового буфера, Stop/замена/закрытие + факт смерти потока, полный голосовой цикл (real_tts_stream_app); **пробы штатного завершения** (условия падения при закрытии: no_synth/speak/stt_speak, `PROBE_MODE`; crash_probe); восстановление референса (tools/install_tts_reference.py); подбор TTS-голоса: Kokoro-82M, Qwen3-TTS VoiceDesign (MLX, отдельное окружение) + образец macOS `say` + понижение высоты (Rubber Band) + сохранность голоса D (VoiceDesign vs reference, Qwen3 Base; выбран p4); загрузка урока (`tests/test_lesson.py`): корректный урок + понятные ошибки для отсутствующих/неверных полей; урок в разговоре (`tests/test_lesson_session.py`, клиент Ollama подменён): сборка и передача системного контекста (поле `system`), в чате — только реплики, «Новое занятие» — сброс с подтверждением и отмена, смена урока = новое занятие, блокировки во время операций, сбой загрузки урока — понятная ошибка |
@@ -71,9 +71,11 @@ Ollama работает на Windows и доступна через SSH-тунн
   остановлен + понятный статус, БЕЗ автостарта. Stop/новый ответ отменяют
   незавершённый синтез (`cancel()`) — отброшенные куски и WAV НЕ
   публикуются, последний готовый ответ жив для «Повторить ответ».
-- STT определяет язык автоматически (`language=None`) и сохраняет язык
-  речи (русский → русский текст, английский → английский); `task=transcribe`;
-  без перевода и LLM-исправлений.
+- STT занятия рассчитан на АНГЛИЙСКУЮ речь: `language="en"` (дефолт),
+  `task=transcribe` (расшифровка, НЕ перевод). Адаптеры (mlx-whisper,
+  faster-whisper) передают параметры АС-ЕСТЬ из AppConfig, без подмены;
+  `language=None` — явное автоопределение (Whisper решает по первому окну
+  записи). После STT перевода и LLM-исправлений текста НЕТ.
 - **Голосовой ввод — автоматический**: после успешного завершения записи
   (сигнал `recording_completed`) STT запускается сам, а НЕПУСТАЯ расшифровка
   сразу отправляется через `SessionController.send_message` — появляется как
@@ -97,8 +99,9 @@ Ollama работает на Windows и доступна через SSH-тунн
   **исключительно на английском**, даже если пользователь пишет/говорит
   по-русски или просит перевод; непонятно — объяснить проще на
   английском (пример/перефразирование); ответ по-русски — мягко
-  предложить выразить мысль на английском + подсказка. STT продолжает
-  распознавать исходный язык пользователя. «Новое занятие»/смена урока
+  предложить выразить мысль на английском + подсказка. Голосовой ввод
+  занятия рассчитан на английскую речь (`stt_language="en"` по
+  умолчанию; `None` — явное автоопределение). «Новое занятие»/смена урока
   = чистая история; непустую историю сбрасывают только после
   подтверждения (отмена — без изменений); действия доступны после
   завершения текущих операций.
