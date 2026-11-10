@@ -10,9 +10,10 @@
 * ``words`` — список английских слов и устойчивых сочетаний (строки),
   может быть пустым.
 
-Урок по умолчанию — ``lessons/homework12.json`` (содержание опирается
-на исходный материал ``raw/homework12_online.doc``; папка ``raw/`` —
-только локальная, в Git не попадает).
+Уроки лежат в папке ``lessons/`` (JSON-файлы). ``load_lessons()``
+загружает ВСЕ уроки из папки (натуральный порядок по имени файла:
+Урок 9 — до Урока 12); ``load_lesson(path)`` — один файл. Сломанный
+файл не отменяет остальные — его проблема попадает в список ошибок.
 
 ``load_lesson(path)`` проверяет поля и типы и возвращает ``Lesson``.
 При проблемах бросает ``LessonError`` со ВСЕМИ найденными проблемами
@@ -22,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -88,9 +90,22 @@ def _string_list(data: dict, key: str, errors: list[str], min_items: int) -> tup
 # ---------------------------------------------------------------------------
 
 
+def lessons_dir() -> Path:
+    """Папка с уроками: корень проекта → ``lessons``."""
+    return Path(__file__).resolve().parent.parent / "lessons"
+
+
 def default_lesson_path() -> Path:
-    """Путь к первому уроку: корень проекта → ``lessons/homework12.json``."""
-    return Path(__file__).resolve().parent.parent / "lessons" / "homework12.json"
+    """Путь к уроку по умолчанию: ``lessons/homework12.json``."""
+    return lessons_dir() / "homework12.json"
+
+
+def _natural_key(filename: str) -> tuple:
+    """Натуральный порядок имён файлов: homework9.json — до homework12.json."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", filename.lower())
+    )
 
 
 def load_lesson(path: str | Path) -> Lesson:
@@ -149,3 +164,28 @@ def load_lesson(path: str | Path) -> Lesson:
         phrases=phrases,
         words=words,
     )
+
+
+def load_lessons(directory: str | Path | None = None) -> tuple[list[Lesson], list[str]]:
+    """Загружает ВСЕ уроки (``*.json``) из папки ``lessons/``.
+
+    Возвращает:
+        ``(уроки, ошибки)`` — отсортированные уроки (натуральный порядок
+        по имени файла: Урок 9 до Урока 12) и понятные ошибки
+        (``имя файла: проблема``) для некорректных файлов. Сломанный
+        файл не отменяет остальные.
+
+    Бросает:
+        LessonError: папка уроков не найдена или это не папка.
+    """
+    directory = Path(directory) if directory is not None else lessons_dir()
+    if not directory.is_dir():
+        raise LessonError(f"Папка уроков не найдена: {directory}")
+    lessons: list[Lesson] = []
+    errors: list[str] = []
+    for path in sorted(directory.glob("*.json"), key=lambda p: _natural_key(p.name)):
+        try:
+            lessons.append(load_lesson(path))
+        except LessonError as exc:
+            errors.append(f"{path.name}: {exc}")
+    return lessons, errors

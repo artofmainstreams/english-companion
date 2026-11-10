@@ -10,8 +10,10 @@ Intermediate | Intermediate | Advanced), ``name`` (непустая строка
 ``topics`` (хотя бы одна), ``phrases``/``words`` — списки строк
 (могут быть пустыми). Проверяются: реальный урок
 ``lessons/homework12.json``, корректные данные (в т.ч. пустые
-phrases/words) и понятные ``LessonError`` для отсутствующих/неверных
-данных (все проблемы сразу, с именами полей).
+phrases/words), понятные ``LessonError`` для отсутствующих/неверных
+данных (все проблемы сразу, с именами полей) и ``load_lessons()`` —
+все уроки папки в натуральном порядке, сломанный файл не отменяет
+остальные (ошибка — по файлу).
 """
 
 import json
@@ -25,6 +27,7 @@ from companion.lesson import (
     LessonError,
     default_lesson_path,
     load_lesson,
+    load_lessons,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,6 +71,15 @@ class RealLessonTest(unittest.TestCase):
     def test_default_path_is_real_file(self):
         self.assertEqual(default_lesson_path(), REAL_LESSON)
         self.assertTrue(REAL_LESSON.is_file(), f"нет файла {REAL_LESSON}")
+
+    def test_project_lessons_load_clean(self):
+        """Все уроки папки lessons/ проекта загружаются без ошибок."""
+        lessons, errors = load_lessons()
+        self.assertEqual(errors, [], f"некорректные уроки в lessons/: {errors}")
+        self.assertTrue(
+            any(l.id == "hw12" for l in lessons),
+            "Урок 12 должен быть в lessons/",
+        )
 
     def test_identity(self):
         lesson = load_lesson(REAL_LESSON)
@@ -189,6 +201,49 @@ class ErrorTest(unittest.TestCase):
         data = _valid()
         data["objectives"] = "старый формат"
         self._error(data, "неизвестные поля", "objectives")
+
+
+class LoadLessonsTest(unittest.TestCase):
+    """``load_lessons()``: все уроки папки, натуральный порядок, ошибки по файлам."""
+
+    def _make_dir(self, files: dict[str, object]) -> Path:
+        directory = Path(tempfile.mkdtemp(prefix="english-companion-lessons-"))
+        for name, data in files.items():
+            text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+            (directory / name).write_text(text, encoding="utf-8")
+        return directory
+
+    def test_all_lessons_in_natural_order(self) -> None:
+        """homework9.json — до homework12.json (а не лексикографически)."""
+        directory = self._make_dir({
+            "homework12.json": {**_valid(), "id": "hw12", "name": "Урок 12"},
+            "homework9.json": {**_valid(), "id": "hw9", "name": "Урок 9"},
+            "homework2.json": {**_valid(), "id": "hw2", "name": "Урок 2"},
+        })
+        lessons, errors = load_lessons(directory)
+        self.assertEqual(errors, [])
+        self.assertEqual([l.id for l in lessons], ["hw2", "hw9", "hw12"])
+
+    def test_bad_file_does_not_break_others(self) -> None:
+        """Сломанный файл — в ошибках (с именем файла); остальные загружены."""
+        directory = self._make_dir({
+            "bad.json": {**_valid(), "level": "B1"},
+            "good.json": _valid(),
+        })
+        lessons, errors = load_lessons(directory)
+        self.assertEqual([l.id for l in lessons], ["hw-test"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("bad.json", errors[0])
+        self.assertIn("level", errors[0])
+
+    def test_missing_directory_raises(self) -> None:
+        with self.assertRaises(LessonError) as ctx:
+            load_lessons(Path(tempfile.gettempdir()) / "no_such_lessons")
+        self.assertIn("Папка уроков не найдена", str(ctx.exception))
+
+    def test_empty_directory(self) -> None:
+        directory = Path(tempfile.mkdtemp(prefix="english-companion-lessons-empty-"))
+        self.assertEqual(load_lessons(directory), ([], []))
 
 
 if __name__ == "__main__":

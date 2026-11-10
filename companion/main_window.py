@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 
-from .lesson import Lesson, LessonError, default_lesson_path, load_lesson
+from .lesson import Lesson, LessonError, load_lessons
 from .session_controller import SessionController
 from .audio_controller import AudioController
 from .stt_engine import SttEngine
@@ -146,18 +146,20 @@ class MainWindow(QMainWindow):
         self._update_session_gate()
 
     def _load_lessons(self) -> None:
-        """Загружает уроки в комбо («name — level») и выбирает первый.
+        """Загружает ВСЕ уроки из папки ``lessons/`` в комбо («name — level»).
 
-        Сбой загрузки — понятная ошибка в строке статуса и placeholder
-        комбо; отправка недоступна (``controller.can_send`` False —
-        урока нет).
+        Натуральный порядок по имени файла (Урок 9 — до Урока 12);
+        выбирается первый. Некорректный файл не отменяет остальные —
+        его проблема показывается в строке статуса. Если урок не
+        загрузился ни один — placeholder в комбо и отправка недоступна
+        (``controller.can_send`` False — урока нет).
         """
         self.lessons: list[Lesson] = []
-        lesson_error = ""
+        errors: list[str] = []
         try:
-            self.lessons = [load_lesson(default_lesson_path())]
+            self.lessons, errors = load_lessons()
         except LessonError as exc:
-            lesson_error = str(exc)
+            errors = [str(exc)]
         with QSignalBlocker(self.lesson_combo):
             for lesson in self.lessons:
                 self.lesson_combo.addItem(
@@ -166,9 +168,13 @@ class MainWindow(QMainWindow):
         if self.lessons:
             self.controller.set_lesson(self.lessons[0])
         else:
-            self.lesson_combo.setPlaceholderText("Не удалось загрузить урок")
-        if lesson_error:
-            self.status_label.setText(f"Урок не загрузился: {lesson_error}")
+            self.lesson_combo.setPlaceholderText("Не удалось загрузить уроки")
+        if errors:
+            detail = "; ".join(errors)
+            if self.lessons:
+                self.status_label.setText(f"Не все уроки загрузились: {detail}")
+            else:
+                self.status_label.setText(f"Не удалось загрузить уроки: {detail}")
 
     def _operations_idle(self) -> bool:
         """Текущие операции завершены: отправка/распознавание/синтез/аудио свободны."""

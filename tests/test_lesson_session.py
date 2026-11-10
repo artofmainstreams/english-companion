@@ -10,11 +10,14 @@
 английский», без эмодзи/шуток), ФАКТИЧЕСКИЙ payload запроса Ollama
 (системное сообщение первым, урок/уровень/English-only в нём, история
 после него) и то, что в чате выводятся ТОЛЬКО реплики пользователя и
-преподавателя. «Новое занятие»: сброс непустой истории — только с
+преподавателя. Все уроки из папки ``lessons/`` попадают в комбо
+(«name — level», натуральный порядок), выбирается первый;
+некорректный файл — понятная ошибка в статусе, остальные уроки
+работают; урок не загрузился ни один — отправка недоступна.
+«Новое занятие»: сброс непустой истории — только с
 подтверждением (отмена — ничего не меняется), контекст урока
 сохраняется; смена урока = новое занятие с подтверждением; действия
-заблокированы, пока идут операции. Сбой загрузки урока — понятная
-ошибка, отправка недоступна.
+заблокированы, пока идут операции.
 """
 
 import json
@@ -36,6 +39,7 @@ from companion.lesson import (  # noqa: E402
     LessonError,
     default_lesson_path,
     load_lesson,
+    load_lessons,
 )
 from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
@@ -109,6 +113,20 @@ class LessonSessionBase(unittest.TestCase):
         self.window.lesson_combo.addItem(f"{lesson.name} — {lesson.level}", lesson)
         return lesson
 
+    def _combo_index_of(self, lesson: Lesson) -> int:
+        """Индекс урока в комбо по содержимому (позиция заранее не известна)."""
+        for i in range(self.window.lesson_combo.count()):
+            if self.window.lesson_combo.itemData(i) == lesson:
+                return i
+        raise AssertionError("урок не найден в комбо")
+
+    def _select_lesson(self, lesson: Lesson) -> None:
+        """Выбирает урок в комбо (реальный путь окна: ``_on_lesson_changed``).
+
+        История в момент выбора пуста — подтверждения нет.
+        """
+        self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson))
+
 
 class TestTeacherContext(unittest.TestCase):
     """Сборка системного контекста: level/topics/phrases/words + правила."""
@@ -152,35 +170,60 @@ class TestTeacherContext(unittest.TestCase):
 
 
 class TestLessonUi(LessonSessionBase):
-    """Выбор урока в окне: name + level, урок выбран в контроллере."""
+    """Выбор урока в окне: все уроки из lessons/, выбран первый."""
 
-    def test_combo_shows_name_and_level(self) -> None:
+    def test_combo_shows_all_lessons_first_selected(self) -> None:
+        """Все уроки из lessons/ в комбо («name — level»); выбран первый."""
+        lessons, errors = load_lessons()
+        self.assertEqual(errors, [], "уроки в lessons/ должны быть корректны")
         combo = self.window.lesson_combo
-        self.assertEqual(combo.count(), 1)
-        self.assertEqual(combo.itemText(0), "Урок 12 — Elementary")
-        lesson = combo.currentData()
-        self.assertIsInstance(lesson, Lesson)
-        self.assertIs(self.controller.lesson, lesson)
+        self.assertEqual(combo.count(), len(lessons))
+        for i, lesson in enumerate(lessons):
+            self.assertEqual(combo.itemText(i), f"{lesson.name} — {lesson.level}")
+            self.assertEqual(combo.itemData(i), lesson)
+        self.assertEqual(combo.currentData(), lessons[0])
+        self.assertEqual(self.controller.lesson, lessons[0])
         self.assertTrue(self.window.new_session_button.isEnabled())
 
     def test_lesson_load_error_shown(self) -> None:
-        """Урок не загрузился: понятная ошибка, отправка недоступна."""
+        """Урок не загрузился ни один: понятная ошибка, отправка недоступна."""
         controller = SessionController(OllamaClient(self.config))
         controller.selected_model = "m"
-        error = LessonError("Урок некорректен: id: обязательное непустое строковое поле")
-        with mock.patch("companion.main_window.load_lesson", side_effect=error):
+        error = LessonError("Папка уроков не найдена: /tmp/lessons")
+        with mock.patch("companion.main_window.load_lessons", side_effect=error):
             window = MainWindow(controller, self.audio, self.stt)
             _pump(0.1)
         try:
             self.assertEqual(window.lesson_combo.count(), 0)
             self.assertIn(
-                "Не удалось загрузить урок",
+                "Не удалось загрузить уроки",
                 window.lesson_combo.placeholderText(),
             )
-            self.assertIn("Урок не загрузился", window.status_label.text())
+            self.assertIn("Не удалось загрузить уроки", window.status_label.text())
             self.assertIn(str(error), window.status_label.text())
             self.assertFalse(window.new_session_button.isEnabled())
             self.assertFalse(controller.can_send, "без урока отправка запрещена")
+        finally:
+            del window
+
+    def test_partial_errors_keep_good_lessons(self) -> None:
+        """Некорректный файл — в статусе; остальные уроки в комбо и доступны."""
+        lessons, _ = load_lessons()
+        self.assertTrue(lessons, "в lessons/ должен быть хотя бы один урок")
+        controller = SessionController(OllamaClient(self.config))
+        controller.selected_model = "m"
+        with mock.patch(
+            "companion.main_window.load_lessons",
+            return_value=(lessons[:1], ["broken.json: level: одно из [...]"]),
+        ):
+            window = MainWindow(controller, self.audio, self.stt)
+            _pump(0.1)
+        try:
+            self.assertEqual(window.lesson_combo.count(), 1)
+            self.assertEqual(window.lesson_combo.currentData(), lessons[0])
+            self.assertIn("Не все уроки загрузились", window.status_label.text())
+            self.assertIn("broken.json", window.status_label.text())
+            self.assertTrue(controller.can_send, "работоспособные уроки доступны")
         finally:
             del window
 
@@ -189,6 +232,8 @@ class TestSystemContextPassing(LessonSessionBase):
     """Контекст уходит в Ollama вместе с историей; чат — только реплики."""
 
     def test_send_passes_system_context(self) -> None:
+        # Урок 12 выбран в комбо явно: его содержимое проверяется ниже.
+        self._select_lesson(load_lesson(default_lesson_path()))
         send_mock = self._allow_send()
         self.window.message_input.setText("What are you having?")
         self.window.send_message()
@@ -261,6 +306,8 @@ class TestOllamaPayload(LessonSessionBase):
 
     def test_system_message_first_with_lesson_and_english_only(self) -> None:
         net = self._wire_network()
+        # Урок 12 выбран в комбо явно: его содержимое проверяется ниже.
+        self._select_lesson(load_lesson(default_lesson_path()))
         self.window.message_input.setText("I'd like a table for two.")
         self.window.send_message()
         _pump(0.1)
@@ -301,6 +348,8 @@ class TestOllamaPayload(LessonSessionBase):
 
     def test_new_session_resets_history_keeps_lesson_context(self) -> None:
         net = self._wire_network("Hi! How are you?")
+        # Урок 12 выбран в комбо явно: его содержимое проверяется ниже.
+        self._select_lesson(load_lesson(default_lesson_path()))
         self.window.message_input.setText("Hello!")
         self.window.send_message()
         _pump(0.1)
@@ -366,7 +415,7 @@ class TestNewSession(LessonSessionBase):
         lesson = self._second_lesson()
         question = mock.MagicMock(return_value=QMessageBox.StandardButton.Yes)
         with mock.patch("companion.main_window.QMessageBox.question", question):
-            self.window.lesson_combo.setCurrentIndex(1)
+            self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson))
         question.assert_called_once()
         self.assertIs(self.controller.lesson, lesson)
         self.assertEqual(self.controller.history, [])
@@ -377,7 +426,7 @@ class TestNewSession(LessonSessionBase):
         lesson = self._second_lesson()
         question = mock.MagicMock(return_value=QMessageBox.StandardButton.No)
         with mock.patch("companion.main_window.QMessageBox.question", question):
-            self.window.lesson_combo.setCurrentIndex(1)
+            self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson))
         self.assertIsNot(self.controller.lesson, lesson)
         self.assertEqual(len(self.controller.history), 2)
 
