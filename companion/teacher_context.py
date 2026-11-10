@@ -16,7 +16,9 @@ Ollama вместе с историей разговора (поле ``system``)
 * принимаются подходящие по смыслу варианты ответа, даже если они
   отличаются от фраз урока;
 * небольшие ошибки не исправляются после каждой реплики;
-* смысл непонятен → уточняющий вопрос;
+* смысл непонятен → спокойный уточняющий вопрос;
+* спокойная поддержка: без шуток и сарказма, обычный текст —
+  без эмодзи и декоративных символов;
 * преподаватель отвечает ТОЛЬКО на английском, даже если пользователь
   пишет/говорит по-русски или просит перевод; непонятно — объяснить
   проще на английском (пример, перефразирование); ответ по-русски —
@@ -76,7 +78,14 @@ def build_teacher_context(lesson: Lesson) -> str:
         "- Do not correct small mistakes after every reply; keep the flow."
     )
     lines.append(
-        "- If the meaning is unclear, ask one short clarifying question."
+        "- If the meaning is unclear, ask one short, calm clarifying question."
+    )
+    lines.append(
+        "- Keep a calm, supportive tone; no jokes, sarcasm or slang unless "
+        "the student starts it."
+    )
+    lines.append(
+        "- Use plain text only: no emojis and no decorative symbols."
     )
     lines.append("")
     lines.append("Language rules (strict):")

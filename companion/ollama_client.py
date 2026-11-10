@@ -72,8 +72,10 @@ class OllamaClient(QObject):
     def send_chat(self, model: str, messages: list[Message], system: str = "") -> None:
         """Отправить чат-запрос.
 
-        ``system`` — системный контекст (например, из урока): уходит в
-        поле ``system`` запроса и НЕ входит в историю сообщений.
+        ``system`` — системный контекст (например, из урока): уходит
+        ПЕРВЫМ сообщением с ролью ``system``; история сообщений — после
+        него. В ``SessionController.history`` системный контекст НЕ
+        попадает (он собирается заново при каждой отправке).
         """
         if self._chat_reply is not None:
             raise RuntimeError("Запрос уже выполняется")
@@ -84,16 +86,18 @@ class OllamaClient(QObject):
             QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json"
         )
         request.setTransferTimeout(self.config.chat_timeout_ms)
+        payload_messages: list[dict] = []
+        if system:
+            payload_messages.append({"role": "system", "content": system})
+        payload_messages.extend(
+            {"role": message.role, "content": message.content}
+            for message in messages
+        )
         payload = {
             "model": model,
-            "messages": [
-                {"role": message.role, "content": message.content}
-                for message in messages
-            ],
+            "messages": payload_messages,
             "stream": False,
         }
-        if system:
-            payload["system"] = system
         self._chat_reply = self.network.post(
             request, json.dumps(payload, ensure_ascii=False).encode("utf-8")
         )

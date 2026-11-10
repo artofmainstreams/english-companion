@@ -4,16 +4,20 @@
 
     QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests
 
-Клиент Ollama подменён (mock ``send_chat``): без сети проверяются
-сборка системного контекста из урока (level/topics/phrases/words +
-правила преподавателя), его передача в Ollama (поле ``system``) и то,
-что в чате выводятся ТОЛЬКО реплики пользователя и преподавателя.
-«Новое занятие»: сброс непустой истории — только с подтверждением
-(отмена — ничего не меняется); смена урока = новое занятие с
-подтверждением; действия заблокированы, пока идут операции.
-Сбой загрузки урока — понятная ошибка, отправка недоступна.
+Клиент Ollama подменяется (mock ``send_chat`` / подмена сетевого
+слоя): без сети проверяются сборка системного контекста из урока
+(level/topics/phrases/words + правила преподавателя, «только
+английский», без эмодзи/шуток), ФАКТИЧЕСКИЙ payload запроса Ollama
+(системное сообщение первым, урок/уровень/English-only в нём, история
+после него) и то, что в чате выводятся ТОЛЬКО реплики пользователя и
+преподавателя. «Новое занятие»: сброс непустой истории — только с
+подтверждением (отмена — ничего не меняется), контекст урока
+сохраняется; смена урока = новое занятие с подтверждением; действия
+заблокированы, пока идут операции. Сбой загрузки урока — понятная
+ошибка, отправка недоступна.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -21,7 +25,8 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal  # noqa: E402
+from PySide6.QtNetwork import QNetworkReply  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from companion.audio_controller import AudioController  # noqa: E402
@@ -124,8 +129,11 @@ class TestTeacherContext(unittest.TestCase):
         self.assertIn("one question", context)
         self.assertIn("ONLY in English", context)
         self.assertIn("Russian", context)
-        self.assertIn("clarifying", context)
+        self.assertIn("calm clarifying question", context)
         self.assertIn("Do not correct small mistakes", context)
+        self.assertIn("no emojis", context)
+        self.assertIn("no jokes", context)
+        self.assertIn("plain text", context)
 
     def test_empty_phrases_and_words_ok(self) -> None:
         lesson = Lesson(
@@ -201,6 +209,119 @@ class TestSystemContextPassing(LessonSessionBase):
         self.assertIn("You: Hello!", chat)
         self.assertIn("Teacher · m: Hi! How are you?", chat)
         self.assertEqual(len(self.controller.history), 2)
+
+
+class _FakeReply(QObject):
+    """Завершённый сетевой ответ с телом ответа Ollama."""
+
+    finished = Signal()
+
+    def __init__(self, body: bytes) -> None:
+        super().__init__()
+        self._body = body
+
+    def error(self):
+        return QNetworkReply.NetworkError.NoError
+
+    def errorString(self) -> str:
+        return ""
+
+    def readAll(self) -> bytes:
+        return self._body
+
+    def deleteLater(self) -> None:
+        pass
+
+
+class _FakeNetwork:
+    """Подмена QNetworkAccessManager: ловит payload и отвечает готовым
+    телом Ollama (через сигнал ``finished`` в следующем прогоне цикла)."""
+
+    def __init__(self, answer: str) -> None:
+        self.last_payload: dict | None = None
+        self._body = json.dumps(
+            {"message": {"role": "assistant", "content": answer}, "done": True}
+        ).encode("utf-8")
+
+    def post(self, request, data: bytes):
+        self.last_payload = json.loads(bytes(data).decode("utf-8"))
+        reply = _FakeReply(self._body)
+        QTimer.singleShot(0, reply.finished.emit)
+        return reply
+
+
+class TestOllamaPayload(LessonSessionBase):
+    """Фактический payload запроса Ollama (подмена на сетевом слое)."""
+
+    def _wire_network(self, answer: str = "Sure! What would you like?") -> _FakeNetwork:
+        net = _FakeNetwork(answer)
+        self.controller.client.network = net
+        self.controller.selected_model = "m"
+        return net
+
+    def test_system_message_first_with_lesson_and_english_only(self) -> None:
+        net = self._wire_network()
+        self.window.message_input.setText("I'd like a table for two.")
+        self.window.send_message()
+        _pump(0.1)
+        self.assertIsNotNone(net.last_payload)
+        messages = net.last_payload["messages"]
+        # Системное сообщение присутствует ПЕРВЫМ.
+        self.assertEqual(messages[0]["role"], "system")
+        system_text = messages[0]["content"]
+        self.assertIn("Урок 12", system_text)
+        self.assertIn("Elementary", system_text)
+        self.assertIn("ONLY in English", system_text)
+        self.assertIn("no emojis", system_text)
+        self.assertIn("no jokes", system_text)
+        self.assertIn("1-3 sentences", system_text)
+        # После системного сообщения — текущая история (на момент запроса
+        # это реплика пользователя; ответ придёт позже — см. второй ход).
+        self.assertEqual([m["role"] for m in messages[1:]], ["user"])
+        self.assertEqual(messages[1]["content"], "I'd like a table for two.")
+        # Ответ получен и история выросла (для следующего хода).
+        self.assertEqual(len(self.controller.history), 2)
+        # Лишнего верхнеуровневого "system" нет — всё в messages.
+        self.assertNotIn("system", net.last_payload)
+
+    def test_second_turn_full_history_after_system(self) -> None:
+        net = self._wire_network("Hi! How are you?")
+        self.window.message_input.setText("Hello!")
+        self.window.send_message()
+        _pump(0.1)
+        self.window.message_input.setText("I'm hungry.")
+        self.window.send_message()
+        _pump(0.1)
+        messages = net.last_payload["messages"]
+        self.assertEqual(
+            [m["role"] for m in messages], ["system", "user", "assistant", "user"]
+        )
+        self.assertEqual(messages[2]["content"], "Hi! How are you?")
+        self.assertEqual(messages[3]["content"], "I'm hungry.")
+
+    def test_new_session_resets_history_keeps_lesson_context(self) -> None:
+        net = self._wire_network("Hi! How are you?")
+        self.window.message_input.setText("Hello!")
+        self.window.send_message()
+        _pump(0.1)
+        self.assertEqual(len(self.controller.history), 2)
+        # Непустая история → подтверждение сброса.
+        question = mock.MagicMock(return_value=QMessageBox.StandardButton.Yes)
+        with mock.patch("companion.main_window.QMessageBox.question", question):
+            self.window.on_new_session()
+        question.assert_called_once()
+        self.assertEqual(self.controller.history, [])
+        # Новая отправка: контекст урока сохранён, история чистая.
+        self.window.message_input.setText("I'd like a table for two.")
+        self.window.send_message()
+        _pump(0.1)
+        messages = net.last_payload["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("Урок 12", messages[0]["content"])
+        self.assertIn("Elementary", messages[0]["content"])
+        self.assertIn("ONLY in English", messages[0]["content"])
+        self.assertEqual([m["role"] for m in messages[1:]], ["user"])
+        self.assertEqual(messages[1]["content"], "I'd like a table for two.")
 
 
 class TestNewSession(LessonSessionBase):
