@@ -279,6 +279,32 @@ class AudioRecorder(QObject):
         self._log_event("record:stop-requested")
         self._recorder.stop()
 
+    def cancel_recording(self) -> None:
+        """Отменяет запись: останавливает сессию и отбрасывает файл.
+
+        ``recording_completed`` НЕ поднимается — распознавание не
+        запускается: запись не считается готовой. Используется для
+        отмены перезаписи реплики. Вне записи — без действия.
+        """
+        if self._shutdown or self.state != self.RECORDING or self._recorder is None:
+            return
+        self._log_event("record:cancel-requested")
+        # Сессия помечена «сбойной»: даже если поздний StoppedState дойдёт
+        # до _finalize_recording, «готовая запись» не опубликуется.
+        self._session_failed = True
+        cancelled_file = self._record_file
+        self._ready_recording = None
+        self._record_file = None
+        self._teardown_recording()
+        if cancelled_file is not None and os.path.exists(cancelled_file):
+            try:
+                os.remove(cancelled_file)
+            except OSError:
+                pass  # файл уже убран (например, shutdown)
+        self.state = self.IDLE
+        self.status = "Запись отменена."
+        self.state_changed.emit()
+
     def shutdown(self) -> None:
         """Останавливает запись и удаляет СВОИ временные файлы. Идемпотентна.
 

@@ -70,8 +70,24 @@ class MainWindow(QMainWindow):
         # «Повторить ответ» — повторный проигрыш последней готовой
         # голосовой реплики преподавателя, без нового запроса к Ollama.
         self.repeat_button = QPushButton("Повторить ответ")
+        # «Перезаписать» — новая запись поверх последней реплики
+        # пользователя (пока после неё нет следующего сообщения
+        # пользователя): замена реплики и связанного ответа.
+        self.rerecord_button = QPushButton("Перезаписать")
+        # «Отмена перезаписи» — отбросить текущую запись; прежний обмен
+        # остаётся на месте, незавершённый ответ не перезапускается.
+        self.rerecord_cancel_button = QPushButton("Отмена перезаписи")
+        # «Повторить запрос» — повторить сбойный запрос к преподавателю
+        # без дублирования реплики пользователя.
+        self.retry_button = QPushButton("Повторить запрос")
         self.audio_status_label = QLabel("Голос: готов")
         self.stt_status_label = QLabel("Распознавание: готов")
+        # Перезапись последней реплики: активна от клика «Перезаписать»
+        # до успешной замены / отмены / пустого результата / ошибки STT.
+        # До успешного распознавания прежний обмен НЕ трогается.
+        self._rerecord_active = False
+        self._rerecord_restore: Message | None = None
+        self._rerecord_had_pending = False
 
         # Выбор устройства ввода: позиция 0 — «Системный (по умолчанию)»,
         # дальше — доступные микрофоны. Во время записи переключение
@@ -89,6 +105,9 @@ class MainWindow(QMainWindow):
         self.record_button.clicked.connect(self.toggle_record)
         self.play_button.clicked.connect(self.toggle_play)
         self.repeat_button.clicked.connect(self.repeat_reply)
+        self.rerecord_button.clicked.connect(self.on_rerecord)
+        self.rerecord_cancel_button.clicked.connect(self.on_rerecord_cancel)
+        self.retry_button.clicked.connect(self.on_retry_request)
         self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
         self.new_session_button.clicked.connect(self.on_new_session)
         self.lesson_combo.currentIndexChanged.connect(self._on_lesson_changed)
@@ -101,6 +120,9 @@ class MainWindow(QMainWindow):
         audio_layout.addWidget(self.record_button)
         audio_layout.addWidget(self.play_button)
         audio_layout.addWidget(self.repeat_button)
+        audio_layout.addWidget(self.rerecord_button)
+        audio_layout.addWidget(self.rerecord_cancel_button)
+        audio_layout.addWidget(self.retry_button)
         audio_layout.addWidget(QLabel("Микрофон:"))
         audio_layout.addWidget(self.mic_combo)
         audio_layout.addWidget(self.audio_status_label, 1)
@@ -130,6 +152,9 @@ class MainWindow(QMainWindow):
 
         controller.state_changed.connect(self.render_state)
         controller.message_added.connect(self.append_message)
+        # Перезапись/отмена: окно перерисовывает чат целиком из
+        # контроллера (история + реплика в работе).
+        controller.history_changed.connect(self._render_history)
         audio.state_changed.connect(self.render_audio)
         audio.devices_changed.connect(self._refresh_mic_combo)
         # Успешное завершение записи → сам запускаем распознавание по готовому
@@ -254,13 +279,31 @@ class MainWindow(QMainWindow):
         # Ожидание ответа (controller.busy) тоже блокирует запись.
         self._update_record_gate()
         self._update_session_gate()
+        self._update_rerecord_gates()
+
+    @staticmethod
+    def _format_message(message: Message) -> str:
+        speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
+        return f"{speaker}: {message.content}\n"
 
     def append_message(self, message: Message) -> None:
-        speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
         # Текст сразу виден в чате; затем — озвучивание реплики преподавателя.
-        self.history.appendPlainText(f"{speaker}: {message.content}\n")
+        self.history.appendPlainText(self._format_message(message))
         if message.role == "assistant":
             self.audio.speak_reply(message.content)
+
+    def _render_history(self) -> None:
+        """Перерисовывает весь чат по контроллеру (перезапись/отмена).
+
+        Источник правды — ``SessionController``: история (только завершённые
+        обмены) + реплика в работе (её ответ ещё не пришёл). Старая
+        реплика и связанный с ней ответ после замены исчезают из окна —
+        как из истории, отправляемой в Ollama.
+        """
+        parts = [self._format_message(m) for m in self.controller.history]
+        if self.controller.pending_message is not None:
+            parts.append(self._format_message(self.controller.pending_message))
+        self.history.setPlainText("".join(parts))
 
     def select_model(self) -> None:
         self.controller.select_model(self.model_combo.currentText())
@@ -280,6 +323,7 @@ class MainWindow(QMainWindow):
         # реплика обрабатывается, новая запись запрещена.
         self._update_record_gate()
         self._update_session_gate()
+        self._update_rerecord_gates()
 
         self.play_button.setEnabled(audio.can_play or playing)
         self.play_button.setText("Стоп" if playing else "Прослушать")
@@ -385,6 +429,24 @@ class MainWindow(QMainWindow):
 
     def _on_stt_recognized(self, text: str) -> None:
         text = (text or "").strip()
+        if self._rerecord_active:
+            # Перезапись: до успешного распознавания прежний обмен не тронут.
+            if not text:
+                self._finish_rerecord_incomplete("пустой результат")
+                return
+            target = self._rerecord_restore
+            if self.controller.replace_last_user_message(text, target):
+                # Замена подтверждена: чат перерисован (history_changed),
+                # новый ответ придёт и будет озвучен (message_added).
+                self._rerecord_active = False
+                self._rerecord_restore = None
+                self._rerecord_had_pending = False
+                self.status_label.setText("Перезаписано; отвечаю…")
+            else:
+                self._finish_rerecord_incomplete("замена не прошла")
+            self._update_record_gate()
+            self._update_rerecord_gates()
+            return
         if not text:
             # Пустой результат: ничего не отправляем.
             self.status_label.setText("Речь не распознана (пустой результат).")
@@ -414,6 +476,11 @@ class MainWindow(QMainWindow):
         self._update_record_gate()
 
     def _on_stt_failed(self, message: str) -> None:
+        if self._rerecord_active:
+            # Ошибка STT во время перезаписи: прежний обмен остаётся.
+            self.stt_status_label.setText(message)
+            self._finish_rerecord_incomplete("ошибка распознавания")
+            return
         self.stt_status_label.setText(message)
         self.status_label.setText("Ошибка распознавания.")
         # Ошибка распознавания возвращает доступность записи.
@@ -441,6 +508,100 @@ class MainWindow(QMainWindow):
         в строку статуса.
         """
         self.audio.replay_reply()
+
+    # --- Перезапись последней реплики пользователя -------------------------
+
+    def _can_rerecord(self) -> bool:
+        """Можно ли начать перезапись последней реплики пользователя.
+
+        Доступна, пока после этой реплики нет следующего сообщения
+        пользователя (ответ преподавателя после неё не препятствует — он
+        будет убран вместе с ней). Во время активной перезаписи,
+        распознавания или без модели/урока — недоступна.
+        """
+        if self._rerecord_active:
+            return False
+        if self.stt.is_busy:
+            return False
+        if not (self.controller.selected_model and self.controller.lesson):
+            return False
+        return self.controller.last_user_message() is not None
+
+    def on_rerecord(self) -> None:
+        """«Перезаписать»: остановить текущий ответ и озвучивание, начать
+        новую запись поверх последней реплики пользователя.
+
+        До успешного распознавания прежний обмен остаётся на месте.
+        Запоздалые результаты прежних операций отбрасываются. Одна
+        перезапись — максимум одна замена и один новый запрос.
+        """
+        if self._rerecord_active or not self._can_rerecord():
+            return
+        target = self.controller.last_user_message()
+        if target is None:
+            return
+        self._rerecord_active = True
+        self._rerecord_restore = target
+        self._rerecord_had_pending = self.controller.pending_message is not None
+        # Останавливаем текущий ответ преподавателя и его озвучивание.
+        self.audio.stop_playback()
+        # Старый голосовой ответ — недоступен для повтора.
+        self.audio.suppress_reply()
+        # Запрос в работе отменяем: поздний результат отбрасывается тихо.
+        self.controller.discard_pending()
+        # Новая запись (или продолжаем уже идущую — она станет перезаписью).
+        if self.audio.state != self.audio.RECORDING:
+            self.audio.record()
+        self.status_label.setText("Перезаписываю последнюю реплику…")
+        self._update_rerecord_gates()
+
+    def on_rerecord_cancel(self) -> None:
+        """«Отмена перезаписи»: отбросить запись; прежний обмен остаётся.
+
+        Незавершённый старый ответ НЕ запускается автоматически; прежний
+        повтор (если готовый файл сохранился) возвращается.
+        """
+        if not self._rerecord_active:
+            return
+        self.audio.cancel_recording()
+        self._finish_rerecord_incomplete("отмена")
+
+    def _finish_rerecord_incomplete(self, reason: str) -> None:
+        """Отмена / пустой результат / ошибка STT: прежний обмен на месте.
+
+        Если запрос был в работе, его реплика возвращается в «ждёт ответ»
+        БЕЗ нового запроса; прежний повтор возвращается (если файл есть).
+        """
+        self._rerecord_active = False
+        had_pending = self._rerecord_had_pending
+        target = self._rerecord_restore
+        self._rerecord_restore = None
+        self._rerecord_had_pending = False
+        if had_pending and target is not None:
+            self.controller.restore_pending(target)
+        self.audio.unsuppress_reply()
+        self.status_label.setText(
+            f"Перезапись не завершена ({reason}): прежний обмен сохранён."
+        )
+        self._update_record_gate()
+        self._update_rerecord_gates()
+
+    def on_retry_request(self) -> None:
+        """«Повторить запрос»: повторить сбойный запрос к преподавателю
+        без дублирования реплики пользователя (она уже в чате)."""
+        if self.controller.retry_last_user_message():
+            self.status_label.setText("Повторяю запрос…")
+        self._update_rerecord_gates()
+
+    def _update_rerecord_gates(self) -> None:
+        """Доступность «Перезаписать» / «Отмена перезаписи» / «Повторить запрос»."""
+        self.rerecord_button.setEnabled(self._can_rerecord())
+        self.rerecord_cancel_button.setEnabled(self._rerecord_active)
+        self.retry_button.setEnabled(
+            self.controller.retry_message is not None
+            and not self.controller.busy
+            and not self._rerecord_active
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802 — имя из Qt
         # Если STT ещё работает — нельзя закрываться: файл читается, а

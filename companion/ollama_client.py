@@ -103,6 +103,28 @@ class OllamaClient(QObject):
         )
         self._chat_reply.finished.connect(self._on_chat_completed)
 
+    def abort_chat(self) -> bool:
+        """Отменяет выполняющийся чат-запрос; его результат отбрасывается.
+
+        Используется, когда пользователь отменяет ответ (например, при
+        перезаписи реплики): ``finished`` отменённого запроса НЕ порождает
+        ``chat_completed``/``chat_failed`` (слот отключается до ``abort``).
+        Возвращает ``False``, если запроса в работе не было.
+        """
+        reply = self._chat_reply
+        if reply is None:
+            return False
+        self._chat_reply = None
+        try:
+            reply.finished.disconnect(self._on_chat_completed)
+        except (TypeError, RuntimeError):
+            pass  # слот уже отключён — нормально
+        abort = getattr(reply, "abort", None)
+        if callable(abort):
+            abort()
+        reply.deleteLater()
+        return True
+
     @staticmethod
     def parse_chat(payload: bytes) -> str:
         data = json.loads(payload.decode("utf-8"))
