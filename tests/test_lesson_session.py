@@ -7,7 +7,10 @@
 Клиент Ollama подменяется (mock ``send_chat`` / подмена сетевого
 слоя): без сети проверяются сборка системного контекста из урока
 (level/topics/phrases/words + правила преподавателя, «только
-английский», без эмодзи/шуток), ФАКТИЧЕСКИЙ payload запроса Ollama
+английский», без эмодзи/шуток) и учебное поведение: фразы/слова —
+материал ученика, роли и место до ситуации, факты ситуации
+задаёт преподаватель, лестница помощи при «I don't know», разные
+способы практики — плюс ФАКТИЧЕСКИЙ payload запроса Ollama
 (системное сообщение первым, урок/уровень/English-only в нём, история
 после него) и то, что в чате выводятся ТОЛЬКО реплики пользователя и
 преподавателя. Все уроки из папки ``lessons/`` попадают в комбо
@@ -152,6 +155,48 @@ class TestTeacherContext(unittest.TestCase):
         self.assertIn("no emojis", context)
         self.assertIn("no jokes", context)
         self.assertIn("plain text", context)
+
+    def test_context_marks_material_as_students(self) -> None:
+        """Фразы/слова — материал УЧЕНИКА; не сценарий преподавателя."""
+        lesson = load_lesson(default_lesson_path())
+        context = build_teacher_context(lesson)
+        self.assertIn("the student's practice material", context)
+        self.assertIn("Do not read the list as your own script", context)
+        self.assertIn(
+            "the current situation decides which expressions are natural",
+            context,
+        )
+        self.assertIn("natural for your role", context)
+
+    def test_context_roles_situation_and_questions(self) -> None:
+        """Роли и место; преподаватель задаёт факты; вопросы — только
+        на сообщённые сведения, предпочтения или действие ученика."""
+        lesson = load_lesson(default_lesson_path())
+        context = build_teacher_context(lesson)
+        self.assertIn("briefly set the roles and the place", context)
+        self.assertIn("Keep the roles until the situation clearly ends", context)
+        self.assertIn("You provide the invented facts of the situation", context)
+        self.assertIn("prices, breakfast time, room availability", context)
+        self.assertIn("their preferences, or an action they can take", context)
+
+    def test_context_i_dont_know_help_ladder(self) -> None:
+        """«I don't know»: информация → подсказка → начало фразы → пример
+        → ученик пробует сам."""
+        lesson = load_lesson(default_lesson_path())
+        context = build_teacher_context(lesson)
+        self.assertIn("I don't know", context)
+        self.assertIn("give any missing facts", context)
+        self.assertIn("short English hint", context)
+        self.assertIn("phrase starter, then a full example", context)
+        self.assertIn("let the student try again on their own", context)
+
+    def test_context_varies_practice(self) -> None:
+        """Практика разными способами: вопросы, пожелания, просьбы, ответы."""
+        lesson = load_lesson(default_lesson_path())
+        context = build_teacher_context(lesson)
+        self.assertIn("Vary the practice", context)
+        self.assertIn("expresses wishes, makes requests", context)
+        self.assertIn("asks for clarification", context)
 
     def test_empty_phrases_and_words_ok(self) -> None:
         lesson = Lesson(
@@ -322,6 +367,10 @@ class TestOllamaPayload(LessonSessionBase):
         self.assertIn("no emojis", system_text)
         self.assertIn("no jokes", system_text)
         self.assertIn("1-3 sentences", system_text)
+        # Правила учебного поведения дошли до Ollama (подмена сети).
+        self.assertIn("the student's practice material", system_text)
+        self.assertIn("set the roles and the place", system_text)
+        self.assertIn("You provide the invented facts", system_text)
         # После системного сообщения — текущая история (на момент запроса
         # это реплика пользователя; ответ придёт позже — см. второй ход).
         self.assertEqual([m["role"] for m in messages[1:]], ["user"])
