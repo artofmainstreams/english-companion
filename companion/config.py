@@ -1,11 +1,66 @@
 from dataclasses import dataclass
 
+from .app_data import tts_reference_path
+from .tts_qwen3 import (
+    DEFAULT_INSTRUCT,
+    DEFAULT_MODEL_REFERENCE,
+    DEFAULT_MODEL_VOICE_DESIGN,
+    DEFAULT_REF_TEXT,
+)
+from .tts_synth import DEFAULT_VOICE
+
 
 @dataclass(frozen=True)
 class AppConfig:
     ollama_base_url: str = "http://127.0.0.1:11434"
     request_timeout_ms: int = 10_000
     chat_timeout_ms: int = 180_000
+
+    # Озвучивание ответов преподавателя (TTS).
+    # tts_engine: "qwen3" (по умолчанию; локальная Qwen3-TTS, MLX; синтез —
+    # фоновый поток, голос — референс p4; см. README) или "say"
+    # (macOS say, голос — tts_voice) как резервный движок.
+    tts_engine: str = "qwen3"
+    # Английский голос macOS say (только tts_engine="say"). Имя
+    # проверяется списком голосов: ``say -v '?'``. Если голоса на системе
+    # нет, say молча возьмёт голос по умолчанию — это поведение macOS,
+    # компонент синтеза на него не влияет.
+    tts_voice: str = DEFAULT_VOICE
+
+    # Qwen3-TTS (tts_engine="qwen3"):
+    # tts_qwen3_method: "reference" (по умолчанию: модель Base + одна
+    # чистая реплика tts_qwen3_ref_audio и её точный текст
+    # tts_qwen3_ref_text — одобренный голос p4) или "voice_design"
+    # (модель + описание голоса tts_qwen3_instruct).
+    # Weights — в кэше Hugging Face (~4 GiB), вне репозитория.
+
+    tts_qwen3_method: str = "reference"
+    tts_qwen3_model_voice_design: str = DEFAULT_MODEL_VOICE_DESIGN
+    tts_qwen3_model_reference: str = DEFAULT_MODEL_REFERENCE
+    # Описание голоса — выбранный голос D (образец qwen3_low_D.wav);
+    # используется, только если tts_qwen3_method == "voice_design".
+    tts_qwen3_instruct: str = DEFAULT_INSTRUCT
+    # Референс способа "reference": файл кладётся в постоянную папку
+    # данных приложения (переживает переустановку; установка —
+    # tools/install_tts_reference.py). При отсутствии файла синтез
+    # завершается понятной ошибкой (см. tts_qwen3.py).
+    tts_qwen3_ref_audio: str = str(tts_reference_path())
+    tts_qwen3_ref_text: str = DEFAULT_REF_TEXT
+
+    # Потоковый вывод (речь частями через sounddevice/PortAudio):
+    # tts_qwen3_streaming — ВКЛ/ВЫКЛ. Выключено по умолчанию: полный WAV
+    # → QMediaPlayer (CoreAudio) звучит ЧИСТО, а sounddevice/PortAudio на
+    # этой сборке macOS выдаёт «помехи/искажение» (проверено на слух: тот же
+    # клип чистый через QMediaPlayer, с помехами через sounddevice). Стриминг
+    # дают включением True — тогда речь стартует быстрее (меньше TTFC), но
+    # звучит хрипловато; выбор за пользователем.
+    # tts_qwen3_streaming_interval — размер куска в секундах (0.5 —
+    # проверено: TTFS ~0.7 c, без недочётов; см. real_tts_stream_app.py);
+    # tts_qwen3_start_buffer_ms — стартовый буфер (мс) вывода: вывод
+    # стартует, когда накоплено не меньше этого аудио (защита от недочётов).
+    tts_qwen3_streaming: bool = False
+    tts_qwen3_streaming_interval: float = 0.5
+    tts_qwen3_start_buffer_ms: int = 500
 
     # Локальное распознавание речи.
     # stt_backend: "mlx" (по умолчанию; macOS arm64 + системный ffmpeg) или

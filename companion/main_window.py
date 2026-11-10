@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
-    QMessageBox,
 )
 
 
@@ -60,8 +59,9 @@ class MainWindow(QMainWindow):
 
         self.record_button = QPushButton("Записать")
         self.play_button = QPushButton("Прослушать")
-        self.recognize_button = QPushButton("Распознать")
-        self.save_button = QPushButton("Сохранить")
+        # «Повторить ответ» — повторный проигрыш последней готовой
+        # голосовой реплики преподавателя, без нового запроса к Ollama.
+        self.repeat_button = QPushButton("Повторить ответ")
         self.audio_status_label = QLabel("Голос: готов")
         self.stt_status_label = QLabel("Распознавание: готов")
 
@@ -80,8 +80,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(controller.load_models)
         self.record_button.clicked.connect(self.toggle_record)
         self.play_button.clicked.connect(self.toggle_play)
-        self.recognize_button.clicked.connect(self.start_recognition)
-        self.save_button.clicked.connect(self.save_recording)
+        self.repeat_button.clicked.connect(self.repeat_reply)
         self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
 
         input_layout = QHBoxLayout()
@@ -91,8 +90,7 @@ class MainWindow(QMainWindow):
         audio_layout = QHBoxLayout()
         audio_layout.addWidget(self.record_button)
         audio_layout.addWidget(self.play_button)
-        audio_layout.addWidget(self.recognize_button)
-        audio_layout.addWidget(self.save_button)
+        audio_layout.addWidget(self.repeat_button)
         audio_layout.addWidget(QLabel("Микрофон:"))
         audio_layout.addWidget(self.mic_combo)
         audio_layout.addWidget(self.audio_status_label, 1)
@@ -118,6 +116,9 @@ class MainWindow(QMainWindow):
         controller.message_added.connect(self.append_message)
         audio.state_changed.connect(self.render_audio)
         audio.devices_changed.connect(self._refresh_mic_combo)
+        # Успешное завершение записи → сам запускаем распознавание по готовому
+        # файлу (одна запись — один запуск STT; сбой/пустая запись не приходят).
+        audio.recording_completed.connect(self._on_recording_completed)
         stt.state_changed.connect(self._on_stt_state_changed)
         stt.recognized.connect(self._on_stt_recognized)
         stt.failed.connect(self._on_stt_failed)
@@ -138,10 +139,15 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(not controller.busy)
         self.status_label.setText(controller.status)
         self.update_send_button()
+        # Ожидание ответа (controller.busy) тоже блокирует запись.
+        self._update_record_gate()
 
     def append_message(self, message: Message) -> None:
         speaker = "You" if message.role == "user" else f"Teacher · {message.model}"
+        # Текст сразу виден в чате; затем — озвучивание реплики преподавателя.
         self.history.appendPlainText(f"{speaker}: {message.content}\n")
+        if message.role == "assistant":
+            self.audio.speak_reply(message.content)
 
     def select_model(self) -> None:
         self.controller.select_model(self.model_combo.currentText())
@@ -154,22 +160,19 @@ class MainWindow(QMainWindow):
 
     def render_audio(self) -> None:
         audio = self.audio
-        stt_busy = self.stt.is_busy
-        recording = audio.state == audio.RECORDING
         playing = audio.state == audio.PLAYING
 
-        # Во время распознавания новую запись запрещаем: файл ещё нужен.
-        self.record_button.setEnabled(
-            (audio.can_record and not stt_busy) or recording
-        )
-        self.record_button.setText("Остановить" if recording else "Записать")
+        # Кнопка «Записать/Остановить» — единый затвор записей (см.
+        # _update_record_gate / _can_start_recording): пока голосовая
+        # реплика обрабатывается, новая запись запрещена.
+        self._update_record_gate()
 
         self.play_button.setEnabled(audio.can_play or playing)
         self.play_button.setText("Стоп" if playing else "Прослушать")
 
-        # Сохранить доступна для завершённой записи; после shutdown
-        # has_recording становится False (путь сбрасывается).
-        self.save_button.setEnabled(audio.has_recording)
+        # «Повторить ответ»: только если есть готовая реплика и аудио
+        # свободно (запись/воспроизведение не идут). После shutdown — нет.
+        self.repeat_button.setEnabled(audio.can_replay)
 
         # Переключение микрофона — только вне записи (требование);
         # после shutdown контроллер не работает, комбо блокируем тоже.
@@ -178,17 +181,43 @@ class MainWindow(QMainWindow):
         )
 
         self.audio_status_label.setText(audio.status)
-        self._render_recognize_button()
 
-    def _render_recognize_button(self) -> None:
-        # Кнопка доступна для завершённой записи и заблокирована, пока
-        # идёт распознавание или идёт запись.
-        audio = self.audio
-        self.recognize_button.setEnabled(
-            self.stt.state == self.stt.IDLE
-            and audio.has_recording
-            and audio.state != audio.RECORDING
-        )
+    def _tts_synth_busy(self) -> bool:
+        """Ещё идёт синтез ответа (WAV пишется, файл не готов)."""
+        return bool(getattr(self.audio.tts, "is_busy", False))
+
+    def _can_start_recording(self) -> bool:
+        """Можно ли начать новую запись прямо сейчас.
+
+        Пока голосовая реплика обрабатывается — запись блокируем: идёт
+        запись/воспроизведение, распознавание, ожидание ответа от Ollama
+        или ещё идёт синтез. Доступность возвращается после ответа,
+        остановки воспроизведения или ошибки (см. render_audio / render_state
+        / сигналы STT — они и вызывают _update_record_gate).
+        """
+        if not self.audio.can_record:
+            return False
+        if self.stt.is_busy:
+            return False
+        if self.controller.busy:
+            return False
+        if self._tts_synth_busy():
+            return False
+        return True
+
+    def _update_record_gate(self) -> None:
+        """Возвращает/забирает доступность «Записать» (единый затвор).
+
+        Пока идёт сама запись — кнопка остаётся активной («Остановить»).
+        В остальное время запись доступна только когда свободны запись/
+        воспроизведение, распознавание, ожидание ответа и синтез.
+        """
+        if self.audio.state == self.audio.RECORDING:
+            self.record_button.setEnabled(True)
+            self.record_button.setText("Остановить")
+        else:
+            self.record_button.setEnabled(self._can_start_recording())
+            self.record_button.setText("Записать")
 
     def _refresh_mic_combo(self) -> None:
         """Перечитывает список микрофонов, сохраняя текущий выбор.
@@ -220,77 +249,68 @@ class MainWindow(QMainWindow):
 
     def _on_stt_state_changed(self) -> None:
         self.stt_status_label.setText(self.stt.status)
-        self._render_recognize_button()
-        # Кнопка записи тоже зависит от занятости STT.
+        # Кнопка записи зависит от занятости STT (и всего остального).
         self.render_audio()
         # Если закрытие было отложено из-за активной работы — завершаем.
         if self._pending_close and not self.stt.is_busy:
             self._pending_close = False
             self.close()
 
+    def _on_recording_completed(self, path: str) -> None:
+        """Успешное завершение записи → автозапуск STT по готовому файлу.
+
+        Сигнал приходит ровно раз на успешную запись (см. рекордер), поэтому
+        одна запись даёт один запуск распознавания. Сбой/пустая запись сигнал
+        не подают — здесь всегда есть реальный готовый файл, а не «пишущийся».
+        """
+        self.stt_status_label.setText("Распознаю речь…")
+        self.status_label.setText("Запись завершена. Распознаю речь…")
+        # SttEngine сам отклонит повторный/запоздалый вызов (busy/shutdown)
+        # и проверит файл, поэтому окно просто передаёт путь готовой записи.
+        self.stt.recognize(path)
+
     def _on_stt_recognized(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
-            # Пустой результат не должен стирать введённый текст.
-            self.stt_status_label.setText(
-                "Распознавание не дало текста; введённый текст сохранён."
-            )
+            # Пустой результат: ничего не отправляем.
             self.status_label.setText("Речь не распознана (пустой результат).")
+            self._update_record_gate()
             return
 
-        current = self.message_input.text().strip()
-        if current:
-            answer = QMessageBox.question(
-                self,
-                "Заменить текст?",
-                "В поле уже есть текст. Заменить его результатом "
-                "распознавания?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+        # Голосовой ввод НЕ трогает поле ввода (оно — для ручного текста):
+        # расшифровка уходит либо в чат (отправка), либо в строку статуса.
+        if not self.controller.can_send:
+            # Отправка недоступна: причина и распознанный текст — в статусе.
+            self.status_label.setText(
+                "Отправка недоступна (нет выбранной модели или идёт запрос). "
+                f"Распознанный текст: «{text}»."
             )
-            if answer != QMessageBox.StandardButton.Yes:
-                self.stt_status_label.setText(
-                    "Текст не изменён (подтверждение отменено)."
-                )
-                self.status_label.setText(
-                    "Распознанный текст проигнорирован; поле не изменено."
-                )
-                return
+            self._update_record_gate()
+            return
 
-        self.message_input.setText(text)
-        self.message_input.setFocus()
-        self.stt_status_label.setText("Распознавание: готов")
-        self.status_label.setText(
-            "Текст распознан. Проверь и отправь вручную."
-        )
+        # Непустая расшифровка → автоотправка (реплика в чате как обычная).
+        # «recognized» срабатывает разово → одна запись даёт одну отправку.
+        if self.controller.send_message(text):
+            self.status_label.setText("Отправлено; отвечаю…")
+        else:
+            # can_send было True, но отправка не прошла — причина в статусе.
+            self.status_label.setText(
+                f"Отправка не прошла, повторите. Распознанный текст: «{text}»."
+            )
+        self._update_record_gate()
 
     def _on_stt_failed(self, message: str) -> None:
         self.stt_status_label.setText(message)
         self.status_label.setText("Ошибка распознавания.")
-
-    def start_recognition(self) -> None:
-        # Путь берём из публичного API контроллера, не трогая приватные поля.
-        audio_path = self.audio.last_recording_path
-        if audio_path is None:
-            self.status_label.setText(
-                "Сначала запиши речь, потом нажми «Распознать»."
-            )
-            return
-        if self.stt.is_busy:
-            return
-        self.stt.recognize(audio_path)
+        # Ошибка распознавания возвращает доступность записи.
+        self._update_record_gate()
 
     def toggle_record(self) -> None:
         if self.audio.state == self.audio.RECORDING:
             self.audio.stop_recording()
         else:
-            # Во время STT новую запись запрещаем: файл ещё читается.
-            if self.stt.is_busy:
-                self.status_label.setText(
-                    "Дождись окончания распознавания, чтобы начать запись."
-                )
-                return
+            # Кнопка активна только когда запись разрешена (см. _update_record_gate);
+            # фасад дополнительно сам отклоняет запись при занятости аудио.
             self.audio.record()
 
     def toggle_play(self) -> None:
@@ -299,14 +319,14 @@ class MainWindow(QMainWindow):
         else:
             self.audio.play()
 
-    def save_recording(self) -> None:
-        """Сохраняет копию последней записи для диагностики (путь — в статусе)."""
-        dest = self.audio.save_last_recording()
-        if dest is not None:
-            self.status_label.setText(
-                "Запись сохранена для диагностики; при закрытии она не удалится."
-            )
-        # Если записи нет — статус контроллера уже объясняет причину.
+    def repeat_reply(self) -> None:
+        """«Повторить ответ»: повторный проигрыш последней готовой реплики.
+
+        Новый запрос к Ollama не выполняется — играет тот же готовый файл.
+        Если готового ответа нет или аудио занято, фасад публикует причину
+        в строку статуса.
+        """
+        self.audio.replay_reply()
 
     def closeEvent(self, event) -> None:  # noqa: N802 — имя из Qt
         # Если STT ещё работает — нельзя закрываться: файл читается, а

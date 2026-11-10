@@ -33,6 +33,16 @@ faster-whisper = [
     # faster-whisper 1.2.1 по-прежнему передаёт (иначе decode_audio падает).
     "av>=11,<18",
 ]
+# Qwen3-TTS (MLX) — озвучивание ответов (tts_engine="qwen3"):
+#     python -m pip install ".[qwen3-tts]"
+# Веса моделей Hugging Face (~4 GiB) скачиваются при первом синтезе
+# и живут в кэше ~/.cache/huggingface (вне репозитория).
+qwen3-tts = [
+    "mlx-audio>=0.6,<0.7 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # Потоковый вывод (речь частями) идёт через PortAudio; QAudioSink в
+    # этой сборке PySide6 не даёт писать куски, поэтому звук — sounddevice.
+    "sounddevice>=0.4,<1",
+]
 
 [tool.setuptools.packages.find]
 include = ["companion*"]

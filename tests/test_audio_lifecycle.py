@@ -144,96 +144,6 @@ class TestControllerGuards(unittest.TestCase):
         self.assertFalse(self.c.can_play)
 
 
-class TestSaveRecording(unittest.TestCase):
-    """Сохранение последней записи для диагностики (без оборудования)."""
-
-    def setUp(self) -> None:
-        _app()
-        self.c = AudioController()
-        self.tmp = tempfile.mkdtemp(prefix="english-companion-savetest-")
-        self.rec = os.path.join(self.tmp, "recording_1.m4a")
-        with open(self.rec, "wb") as f:
-            f.write(b"fake-audio-bytes")
-        # «Завершённая запись» (в тесте допустимо трогать приватные поля;
-        # окно и контроллер работают через публичный API). Готовой является
-        # именно ``_ready_recording`` — «пишущийся» файл сюда не попадает.
-        self.c.recorder._temp_dir = self.tmp
-        self.c.recorder._record_file = self.rec
-        self.c.recorder._ready_recording = self.rec
-        self.dest_dir = tempfile.mkdtemp(prefix="english-companion-saved-")
-
-    def tearDown(self) -> None:
-        self.c.shutdown()
-        _pump(0.1)
-        for d in (self.tmp, self.dest_dir):
-            if os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
-        del self.c
-
-    def test_save_copies_recording_and_reports_path(self) -> None:
-        dest = self.c.save_last_recording(self.dest_dir)
-        self.assertIsNotNone(dest)
-        self.assertTrue(os.path.exists(dest))
-        with open(dest, "rb") as f:
-            self.assertEqual(f.read(), b"fake-audio-bytes")
-        # Оригинал во временной папке до закрытия не тронут.
-        self.assertTrue(os.path.exists(self.rec))
-        self.assertIn("Запись сохранена", self.c.status)
-
-    def test_saved_file_survives_shutdown(self) -> None:
-        """После сохранения копия переживает закрытие; временные файлы уходят."""
-        dest = self.c.save_last_recording(self.dest_dir)
-        self.assertIsNotNone(dest)
-        self.c.shutdown()
-        _pump(0.2)
-        self.assertTrue(
-            os.path.exists(dest),
-            f"сохранённая копия удалена при закрытии: {dest!r}",
-        )
-        self.assertFalse(os.path.isdir(self.tmp), "временная папка должна уйти")
-
-    def test_save_into_temp_dir_rejected(self) -> None:
-        """Экспорт ВНУТРЬ управляемого временного каталога запрещён (регрессия)."""
-        self.assertIsNone(self.c.save_last_recording(self.tmp))
-        self.assertIn("временного", self.c.status)
-        # Копию внутрь не создали: в каталоге остался только оригинал.
-        self.assertEqual(len(os.listdir(self.tmp)), 1)
-
-    def test_save_into_temp_subdir_rejected(self) -> None:
-        """Вложенная папка внутри временного каталога — тоже отказ."""
-        sub = os.path.join(self.tmp, "nested", "out")
-        self.assertIsNone(self.c.save_last_recording(sub))
-        self.assertIn("временного", self.c.status)
-
-    def test_save_into_symlinked_temp_dir_rejected(self) -> None:
-        """Симссылка, ведущая во временный каталог, разрешается — отказ."""
-        link = os.path.join(self.dest_dir, "link-into-tmp")
-        os.symlink(self.tmp, link)
-        try:
-            self.assertIsNone(self.c.save_last_recording(link))
-            self.assertIn("временного", self.c.status)
-        finally:
-            if os.path.islink(link):
-                os.unlink(link)
-
-    def test_save_does_not_overwrite_existing(self) -> None:
-        """Не перезаписываем существующий файл: выбираем свободное имя."""
-        first = self.c.save_last_recording(self.dest_dir)
-        second = self.c.save_last_recording(self.dest_dir)
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        self.assertNotEqual(first, second, "перезаписали существующий файл")
-        self.assertTrue(os.path.exists(first), "первый файл затёрт вторым")
-
-    def test_save_without_recording_returns_none(self) -> None:
-        self.c.recorder._ready_recording = None
-        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
-
-    def test_save_rejected_after_shutdown(self) -> None:
-        self.c.shutdown()
-        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
-
-
 class TestInputDeviceSelection(unittest.TestCase):
     """Выбор устройства ввода: выбор/сброс, hotplug-фолбэк, сторожевые флаги.
 
@@ -461,21 +371,18 @@ class TestRecordingReadiness(unittest.TestCase):
         self.c.recorder._record_file = self.rec
         self.c.recorder._ready_recording = None
         self.c.recorder.state = AudioRecorder.RECORDING
-        self.dest_dir = tempfile.mkdtemp(prefix="english-companion-readdest-")
 
     def tearDown(self) -> None:
         self.c.shutdown()
         _pump(0.1)
-        for d in (self.tmp, self.dest_dir):
-            if os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
+        if os.path.isdir(self.tmp):
+            shutil.rmtree(self.tmp, ignore_errors=True)
         del self.c
 
     def test_in_progress_file_not_ready(self) -> None:
-        """Пока идёт запись, непустой файл НЕ готов (save/play/STT недоступны)."""
+        """Пока идёт запись, непустой файл НЕ готов (play/STT недоступны)."""
         self.assertFalse(self.c.has_recording, "файл в записи помечен готовым")
         self.assertIsNone(self.c.last_recording_path)
-        self.assertIsNone(self.c.save_last_recording(self.dest_dir))
 
     def test_finalized_success_becomes_ready(self) -> None:
         """После подтверждения завершения (Stopped) запись становится готовой."""

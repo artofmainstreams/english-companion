@@ -3,7 +3,11 @@
 ``AudioRecorder`` владеет устройствами ввода (список/выбор/hotplug),
 графом записи (``QAudioInput``/``QMediaRecorder``/``QMediaCaptureSession``)
 и результатом успешно завершённой записи: ``has_recording``,
-``last_recording_path``, ``save_last_recording()``.
+``last_recording_path`` и сигнал ``recording_completed(path)``
+(успешное завершение записи — интерфейс по нему автоматически запускает
+распознавание). Записанная временная запись живёт, пока нужна для
+распознавания/прослушивания; экспорт записи наружу удалён — временные
+файлы удаляются штатно в ``shutdown()``.
 
 Компонент является ЯВНЫМ ВЛАДЕЛЬЦЕМ своих временных файлов: создаёт
 временный каталог при первой записи и удаляет его в ``shutdown()``.
@@ -37,6 +41,10 @@ class AudioRecorder(QObject):
     # интерфейс перечитывает список; если выбранный микрофон пропал,
     # компонент сам возвращается к системному устройству.
     devices_changed = Signal()
+    # Успешно завершённая запись готова (файл существует и непуст): интерфейс
+    # по этому сигналу автоматически запускает распознавание по этому файлу
+    # (одна запись — один запуск STT). Сбой/пустая запись сигнал НЕ подаёт.
+    recording_completed = Signal(str)
 
     IDLE = "idle"
     RECORDING = "recording"
@@ -271,66 +279,13 @@ class AudioRecorder(QObject):
         self._log_event("record:stop-requested")
         self._recorder.stop()
 
-    def save_last_recording(self, dest_dir: str | None = None) -> str | None:
-        """Сохраняет копию последней УСПЕШНО ЗАВЕРШЁННОЙ записи наружу.
-
-        Копия уходит во внешнюю папку (по умолчанию — Рабочий стол) и переживает
-        закрытие окна; временный оригинал (и сам временный каталог) удаляются.
-        Экспорт ВНУТРЬ управляемого временного каталога запрещён — такая копия
-        исчезла бы вместе с ним. Существующий файл не перезаписывается:
-        выбирается свободное имя. Возвращает путь к копии или ``None`` (нет
-        готовой записи, компонент остановлен, либо отказ — причина в ``status``).
-        """
-        if self._shutdown:
-            self.status = "Сохранить нечего: компонент остановлен."
-            self.state_changed.emit()
-            return None
-        if not self.has_recording:
-            self.status = "Сохранить нечего: нет завершённой записи."
-            self.state_changed.emit()
-            return None
-        src = self._ready_recording
-        dest_dir = os.path.abspath(os.path.expanduser(dest_dir or "~/Desktop"))
-
-        # Запрет экспорта внутрь управляемого временного каталога: иначе копия
-        # уйдёт при закрытии вместе с временными файлами. Принадлежность
-        # проверяем по realpath (разрешая симв. ссылки) и commonpath —
-        # корректно, в отличие от строкового startswith.
-        if self._temp_dir is not None and self._is_within(dest_dir, self._temp_dir):
-            self.status = (
-                "Нельзя сохранять внутрь временного каталога — файл удалится "
-                "при закрытии. Укажи папку вне него (например, Рабочий стол)."
-            )
-            self.state_changed.emit()
-            return None
-
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-            ext = os.path.splitext(src)[1] or ".m4a"
-            base = "english-companion"
-            # Не перезаписываем существующий файл (в т.ч. симссылку):
-            # ищем свободное имя.
-            dest = os.path.join(dest_dir, f"{base}{ext}")
-            n = 1
-            while os.path.lexists(dest):
-                dest = os.path.join(dest_dir, f"{base}-{n}{ext}")
-                n += 1
-            shutil.copy2(src, dest)
-        except OSError as exc:
-            self.status = f"Не удалось сохранить запись: {exc}"
-            self.state_changed.emit()
-            return None
-
-        self.status = f"Запись сохранена: {dest}"
-        self.state_changed.emit()
-        return dest
-
     def shutdown(self) -> None:
         """Останавливает запись и удаляет СВОИ временные файлы. Идемпотентна.
 
         После вызова компонент не работает: ``record()`` отклоняется,
-        поздние сигналы Qt игнорируются. Файлы, сохранённые НАРУЖУ
-        (``save_last_recording``), не затрагиваются.
+        поздние сигналы Qt игнорируются. Записанная временная запись, пока она
+        нужна для распознавания/прослушивания, живёт; после shutdown её файл
+        и временный каталог удаляются штатно.
         """
         if self._shutdown:
             return
@@ -472,7 +427,10 @@ class AudioRecorder(QObject):
                 # Готовность публикуем только после подтверждения завершения —
                 # «пишущийся» файл (состояние RECORDING) сюда не попадает.
                 self._ready_recording = self._record_file
-                self.status = "Запись готова. Можно «Прослушать»."
+                self.status = "Запись готова. Распознаю речь…"
+                # Успешное завершение: интерфейс по сигналу сам запускает STT
+                # по ЭТОМУ файлу (одна запись — один запуск).
+                self.recording_completed.emit(self._ready_recording)
             else:
                 self.status = (
                     "Запись пуста — вероятно, нет доступа к микрофону. "
@@ -519,9 +477,8 @@ class AudioRecorder(QObject):
     def _cleanup_temp_dir(self) -> None:
         if self._temp_dir is None:
             return
-        # Экспорт ВНУТРЬ временного каталога запрещён (см. save_last_recording),
-        # поэтому здесь только временные файлы — их безопасно удаляем целиком.
-        # Копии, сохранённые НАРУЖУ, лежат вне каталога и не затрагиваются.
+        # Здесь только временные файлы записи — их безопасно удаляем целиком
+        # (экспорт наружу удалён, поэтому копий вне каталога уже нет).
         try:
             shutil.rmtree(self._temp_dir)
         except OSError as exc:
@@ -564,19 +521,3 @@ class AudioRecorder(QObject):
         if self._format is None:
             return ".m4a"
         return mapping.get(self._format.fileFormat(), ".m4a")
-
-    @staticmethod
-    def _is_within(path: str, base: str) -> bool:
-        """``True``, если ``path`` совпадает с ``base`` или находится внутри него.
-
-        Сравниваем по ``os.path.realpath`` (разрешая символические ссылки) и
-        через ``os.path.commonpath`` — в отличие от строкового ``startswith``,
-        это корректно: ``/tmp/foo-evil`` не считается «внутри» ``/tmp/foo``.
-        """
-        real_path = os.path.realpath(path)
-        real_base = os.path.realpath(base)
-        try:
-            common = os.path.commonpath([real_path, real_base])
-        except ValueError:
-            return False  # разные диски — «внутри» быть не может
-        return common == real_base
