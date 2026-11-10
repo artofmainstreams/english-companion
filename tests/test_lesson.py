@@ -4,13 +4,14 @@
 
     QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests
 
-Без Qt и сети: только чтение JSON и проверка полей. Проверяются:
-* реальный урок ``lessons/homework12.json`` — идентичность (курс, уровень,
-  номер), наполненность, ссылки примеров на строки источника,
-  разделение целей «из документа» / «интерпретация»;
-* корректный минимальный и полный учебные данные;
-* понятные ``LessonError`` для отсутствующих/неверных данных
-  (все проблемы сразу, с именами полей).
+Без Qt и сети: только чтение JSON и проверка полей. Согласованный
+формат: ``id`` (непустая строка), ``level`` (Elementary | Pre-
+Intermediate | Intermediate | Advanced), ``name`` (непустая строка),
+``topics`` (хотя бы одна), ``phrases``/``words`` — списки строк
+(могут быть пустыми). Проверяются: реальный урок
+``lessons/homework12.json``, корректные данные (в т.ч. пустые
+phrases/words) и понятные ``LessonError`` для отсутствующих/неверных
+данных (все проблемы сразу, с именами полей).
 """
 
 import json
@@ -19,6 +20,7 @@ import unittest
 from pathlib import Path
 
 from companion.lesson import (
+    LEVELS,
     Lesson,
     LessonError,
     default_lesson_path,
@@ -28,50 +30,26 @@ from companion.lesson import (
 ROOT = Path(__file__).resolve().parent.parent
 REAL_LESSON = ROOT / "lessons" / "homework12.json"
 
+#: Поля, удалённые из формата (не должны встречаться в JSON).
+REMOVED_KEYS = (
+    "source_document",
+    "objectives",
+    "grammar",
+    "exercises",
+    "resources",
+    "flags",
+)
+
 
 def _valid() -> dict:
-    """Полный корректный урок (все опциональные секции)."""
+    """Корректный урок (все поля)."""
     return {
         "id": "hw-test",
-        "course": "Тестовый курс",
-        "level": "elementary",
-        "number": 1,
-        "title": "Тестовый урок",
-        "source_document": "raw/test.doc",
-        "topics": [{"text": "Тема", "origin": "document"}],
-        "objectives": [
-            {"text": "Цель из источника", "origin": "document", "source_ref": "строка 1"},
-            {"text": "Цель как интерпретация", "origin": "derived"},
-        ],
-        "phrases": [{"en": "Hello!", "ru": "Привет!", "source_ref": "строка 2"}],
-        "grammar": [
-            {
-                "name": "Приветствие",
-                "examples": ["Hello!"],
-                "interpretation": "целевая форма",
-                "origin": "derived",
-                "source_ref": "строка 2",
-            }
-        ],
-        "exercises": [{"task": "Поздороваться", "items": ["Hello!"], "source_ref": "строка 2"}],
-        "resources": [
-            {"kind": "video", "title": "Видео", "note": "под документом", "source_ref": "строка 5"}
-        ],
-        "flags": [{"text": "Спорная формулировка", "location": "строка 2", "reason": "опечатка"}],
-    }
-
-
-def _minimal() -> dict:
-    """Минимальный корректный урок (только обязательные поля)."""
-    return {
-        "id": "hw-test",
-        "course": "Тестовый курс",
-        "level": "a1",
-        "number": 3,
-        "title": "Тестовый урок",
-        "topics": [{"text": "Тема", "origin": "document"}],
-        "objectives": [{"text": "Цель", "origin": "document"}],
-        "phrases": [{"en": "Hello!", "ru": "Привет!"}],
+        "level": "Advanced",
+        "name": "Урок 1",
+        "topics": ["Фразы «В ресторане»", "Present Simple"],
+        "phrases": ["Can you pass me the salt, please?", "We'd like to pay by card."],
+        "words": ["salt", "bill", "pay by card"],
     }
 
 
@@ -91,66 +69,60 @@ class RealLessonTest(unittest.TestCase):
         self.assertEqual(default_lesson_path(), REAL_LESSON)
         self.assertTrue(REAL_LESSON.is_file(), f"нет файла {REAL_LESSON}")
 
-    def test_loads_and_identity(self):
+    def test_identity(self):
         lesson = load_lesson(REAL_LESSON)
         self.assertIsInstance(lesson, Lesson)
         self.assertEqual(lesson.id, "hw12")
-        self.assertEqual(lesson.course, "Выживание за границей")
-        self.assertEqual(lesson.level, "elementary")
-        self.assertEqual(lesson.number, 12)
-        self.assertIn("ресторан", lesson.title.lower())
-        self.assertTrue(lesson.source_document.endswith("homework12_online.doc"))
+        self.assertEqual(lesson.level, "Elementary")
+        self.assertEqual(lesson.name, "Урок 12")
 
-    def test_content_is_populated(self):
-        lesson = load_lesson(REAL_LESSON)
-        self.assertTrue(lesson.topics)
-        self.assertTrue(lesson.objectives)
-        self.assertGreaterEqual(len(lesson.phrases), 20)
-        self.assertTrue(lesson.grammar)
-        self.assertTrue(lesson.exercises)
-        self.assertTrue(lesson.resources)
-        self.assertTrue(lesson.flags)
+    def test_removed_keys_are_gone(self):
+        raw = json.loads(REAL_LESSON.read_text(encoding="utf-8"))
+        for key in REMOVED_KEYS:
+            self.assertNotIn(key, raw, f"поле {key!r} осталось в формате")
 
-    def test_phrases_have_text_and_source_refs(self):
+    def test_topics_cover_structures(self):
         lesson = load_lesson(REAL_LESSON)
+        joined = " ".join(lesson.topics)
+        self.assertIn("Present Simple", joined)
+        self.assertIn("Present Continuous", joined)
+        self.assertIn("Can/Could", joined)
+
+    def test_phrases_kept_and_typos_fixed(self):
+        lesson = load_lesson(REAL_LESSON)
+        self.assertGreaterEqual(len(lesson.phrases), 30)
+        self.assertIn("Smoking or non-smoking?", lesson.phrases)
         for phrase in lesson.phrases:
-            self.assertTrue(phrase.en.strip(), "пустой en")
-            self.assertTrue(phrase.ru.strip(), "пустой ru")
-            self.assertIn("строка", phrase.source_ref, "нет ссылки на строку источника")
+            self.assertNotIn("Smocking", phrase, "опечатка «Smocking» не исправлена")
+            self.assertNotIn("Сan", phrase, "кириллическая «С» в «Can»")
 
-    def test_goals_are_split_by_origin(self):
+    def test_words_extracted(self):
         lesson = load_lesson(REAL_LESSON)
-        origins = {objective.origin for objective in lesson.objectives}
-        self.assertIn("document", origins)
-        self.assertIn("derived", origins)
-
-    def test_translation_exercise_keeps_all_items(self):
-        lesson = load_lesson(REAL_LESSON)
-        translation = [ex for ex in lesson.exercises if "перевести" in ex.task.lower()]
-        self.assertTrue(translation, "нет упражнения на перевод")
-        self.assertGreaterEqual(len(translation[0].items), 20)
+        self.assertTrue(lesson.words)
+        for expected in ("tea", "bill", "reservation", "menu", "spicy food"):
+            self.assertIn(expected, lesson.words)
 
 
 class ValidLessonTest(unittest.TestCase):
-    def test_minimal_loads(self):
-        lesson = load_lesson(_write(_minimal()))
-        self.assertEqual(lesson.id, "hw-test")
-        self.assertEqual(lesson.number, 3)
-        self.assertEqual(lesson.grammar, ())
-        self.assertEqual(lesson.exercises, ())
-        self.assertEqual(lesson.flags, ())
+    def test_all_levels_accepted(self):
+        for level in LEVELS:
+            data = _valid()
+            data["level"] = level
+            self.assertEqual(load_lesson(_write(data)).level, level)
 
-    def test_full_loads(self):
-        lesson = load_lesson(_write(_valid()))
-        self.assertEqual(lesson.topics[0].origin, "document")
-        self.assertEqual(lesson.objectives[1].origin, "derived")
-        self.assertEqual(lesson.objectives[0].source_ref, "строка 1")
-        self.assertEqual(lesson.phrases[0].en, "Hello!")
-        self.assertEqual(lesson.grammar[0].examples, ("Hello!",))
-        self.assertEqual(lesson.grammar[0].interpretation, "целевая форма")
-        self.assertEqual(lesson.exercises[0].items, ("Hello!",))
-        self.assertEqual(lesson.resources[0].title, "Видео")
-        self.assertEqual(lesson.flags[0].location, "строка 2")
+    def test_empty_phrases_and_words_allowed(self):
+        data = _valid()
+        data["phrases"] = []
+        data["words"] = []
+        lesson = load_lesson(_write(data))
+        self.assertEqual(lesson.phrases, ())
+        self.assertEqual(lesson.words, ())
+
+    def test_single_topic_allowed(self):
+        data = _valid()
+        data["topics"] = ["одна тема"]
+        lesson = load_lesson(_write(data))
+        self.assertEqual(lesson.topics, ("одна тема",))
 
 
 class ErrorTest(unittest.TestCase):
@@ -174,53 +146,49 @@ class ErrorTest(unittest.TestCase):
     def test_top_level_must_be_object(self):
         self._error([1, 2, 3], "объект")
 
-    def test_missing_id(self):
-        data = _minimal()
+    def test_missing_id_name_level_reported_together(self):
+        data = _valid()
         del data["id"]
-        self._error(data, "id")
-
-    def test_missing_course_and_level_reported_together(self):
-        data = _minimal()
-        del data["course"]
+        del data["name"]
         del data["level"]
-        message = self._error(data, "course", "level")
+        message = self._error(data, "id", "name", "level")
         self.assertIn("Урок некорректен", message)
 
-    def test_number_must_be_positive_int(self):
-        data = _minimal()
-        data["number"] = "12"
-        self._error(data, "number")
-        data = _minimal()
-        data["number"] = 0
-        self._error(data, "number")
-        data = _minimal()
-        data["number"] = True
-        self._error(data, "number")
+    def test_level_must_be_known(self):
+        data = _valid()
+        data["level"] = "elementary"
+        self._error(data, "level")
+        data = _valid()
+        data["level"] = "B1"
+        self._error(data, "level")
 
     def test_topics_cannot_be_empty(self):
-        data = _minimal()
+        data = _valid()
         data["topics"] = []
         self._error(data, "topics")
 
-    def test_topic_item_must_be_object(self):
-        data = _minimal()
-        data["topics"] = ["просто строка"]
-        self._error(data, "topics[0]")
+    def test_topic_item_must_be_nonempty_string(self):
+        data = _valid()
+        data["topics"] = ["норма", ""]
+        self._error(data, "topics[1]")
 
-    def test_objective_origin_must_be_known(self):
-        data = _minimal()
-        data["objectives"] = [{"text": "Цель", "origin": "magic"}]
-        self._error(data, "origin")
+    def test_phrases_must_be_string_list(self):
+        data = _valid()
+        data["phrases"] = "не список"
+        self._error(data, "phrases")
+        data = _valid()
+        data["phrases"] = ["норма", 42]
+        self._error(data, "phrases[1]")
 
-    def test_phrase_without_russian(self):
-        data = _minimal()
-        data["phrases"] = [{"en": "Hello!"}]
-        self._error(data, "ru")
+    def test_words_must_be_string_list(self):
+        data = _valid()
+        data["words"] = ["tea", ""]
+        self._error(data, "words[1]")
 
     def test_unknown_key_rejected(self):
-        data = _minimal()
-        data["objectivs"] = "опечатка"
-        self._error(data, "неизвестные поля", "objectivs")
+        data = _valid()
+        data["objectives"] = "старый формат"
+        self._error(data, "неизвестные поля", "objectives")
 
 
 if __name__ == "__main__":

@@ -1,249 +1,95 @@
 {
   "id": "hw12",
-  "course": "Выживание за границей",
-  "level": "elementary",
-  "number": 12,
-  "title": "В ресторане",
-  "source_document": "raw/homework12_online.doc",
+  "level": "Elementary",
+  "name": "Урок 12",
   "topics": [
-    {"text": "В ресторане: новые фразы", "origin": "document"},
-    {"text": "Вежливые просьбы Can/Could в ресторане", "origin": "derived"},
-    {"text": "Обслуживание: бронь, меню, заказ, оплата", "origin": "derived"},
-    {"text": "Повторение: перевод предложений (спорт, хобби, география, Present Simple/Continuous, прошедшее время)", "origin": "derived"}
-  ],
-  "objectives": [
-    {
-      "text": "Выучить новые фразы «В ресторане»",
-      "origin": "document",
-      "source_ref": "строка 2 (цель)"
-    },
-    {
-      "text": "Выучить предложения из 2 роликов «Разговорные фразы на английском на тему «Ресторан»» (Часть 1 и Часть 2) и вспоминать перевод ещё до того, как преподаватель озвучит фразу",
-      "origin": "document",
-      "source_ref": "строка 47"
-    },
-    {
-      "text": "Спросить соседа, что он будет есть (диалог «What are you having?»)",
-      "origin": "document",
-      "source_ref": "строка 22"
-    },
-    {
-      "text": "Перевести 22 русские предложения на английский",
-      "origin": "document",
-      "source_ref": "строки 50-73"
-    },
-    {
-      "text": "Уверенно использовать вежливые просьбы «Can/Could you ...? please» и «We'd like to ...» в ресторанном диалоге",
-      "origin": "derived",
-      "source_ref": "строки 11-18"
-    },
-    {
-      "text": "Различать Present Simple (привычки, факты) и Present Continuous (текущие планы) в предложениях для практики",
-      "origin": "derived",
-      "source_ref": "строки 24-29, 52-73"
-    }
+    "Фразы «В ресторане»",
+    "Вежливые просьбы: Can/Could you …, please?; We'd like to …",
+    "Present Continuous для текущих планов: What are you having? / I'm having the pie.",
+    "Present Simple — привычки и факты",
+    "Past Simple — прошедший опыт",
+    "Модальные can/could — способность и вежливая просьба",
+    "Превосходная степень (the biggest) и местоположение: in / between / the capital of"
   ],
   "phrases": [
-    {"en": "Would you like some more tea?", "ru": "Вы не хотите еще чаю?", "source_ref": "строка 4"},
-    {"en": "Let's brew up some more tea.", "ru": "Давайте заварим еще чаю.", "source_ref": "строка 5"},
-    {"en": "Add some more water.", "ru": "Долейте еще воды.", "source_ref": "строка 6"},
-    {"en": "Excuse me, where are the toilets?", "ru": "Извините, где туалеты?", "source_ref": "строка 8"},
-    {"en": "How much is a bottle of water?", "ru": "Сколько стоит бутылка воды?", "source_ref": "строка 9"},
-    {"en": "Can you pass me the salt, please?", "ru": "Можете передать мне соль?", "source_ref": "строка 12"},
-    {"en": "Can you close the window, please?", "ru": "Можете закрыть окно?", "source_ref": "строка 13"},
-    {"en": "Can you bring me another glass, please?", "ru": "Можете принести мне другой стакан?", "source_ref": "строка 14"},
-    {"en": "Can you take our order, please?", "ru": "Можете принять наш заказ?", "source_ref": "строка 15"},
-    {"en": "Can you bring us the bill, please?", "ru": "Можете принести нам счет?", "source_ref": "строка 16"},
-    {"en": "Can you take our plates away, please?", "ru": "Можете унести наши тарелки?", "source_ref": "строка 17"},
-    {"en": "We'd like to pay by card.", "ru": "Мы бы хотели оплатить кредитной картой.", "source_ref": "строка 18"},
-    {"en": "What do you recommend for a main course?", "ru": "Что вы порекомендуете в качестве основного блюда?", "source_ref": "строка 20"},
-    {"en": "What are you having?", "ru": "Что будете?", "source_ref": "строка 24"},
-    {"en": "What are you having for dessert?", "ru": "Что будете на десерт?", "source_ref": "строка 25"},
-    {"en": "I'm having the pie.", "ru": "Я буду пирог.", "source_ref": "строка 29"},
-    {"en": "Is it spicy?", "ru": "Это острое?", "source_ref": "строка 31"},
-    {"en": "I don't like spicy food.", "ru": "Я не люблю острую еду.", "source_ref": "строка 31"},
-    {"en": "Do you have a reservation?", "ru": "У вас забронирован столик?", "source_ref": "строка 33"},
-    {"en": "This way, please.", "ru": "Сюда, пожалуйста.", "source_ref": "строка 34"},
-    {"en": "Follow me, please.", "ru": "Следуйте за мной.", "source_ref": "строка 35"},
-    {"en": "Smocking or non-smocking?", "ru": "Зал для курящих или не курящих?", "source_ref": "строка 36"},
-    {"en": "Here is the menu.", "ru": "Вот меню.", "source_ref": "строка 38"},
-    {"en": "Are you ready to order?", "ru": "Вы готовы заказать?", "source_ref": "строка 39"},
-    {"en": "Can I take your order?", "ru": "Могу я принять ваш заказ?", "source_ref": "строка 40"},
-    {"en": "And for you, Sir (Madam)?", "ru": "А для вас, сэр (мадам)?", "source_ref": "строка 41"},
-    {"en": "The pasta comes with a green salad.", "ru": "Паста подается с зеленым салатом.", "source_ref": "строка 42"},
-    {"en": "Would you like a drink first?", "ru": "Напиток подавать первым?", "source_ref": "строка 43"},
-    {"en": "Would you like anything else?", "ru": "Вы хотите что-нибудь еще?", "source_ref": "строка 44"},
-    {"en": "Is everything all right?", "ru": "Все в порядке?", "source_ref": "строка 45"}
+    "Would you like some more tea?",
+    "Let's brew up some more tea.",
+    "Add some more water.",
+    "Excuse me, where are the toilets?",
+    "How much is a bottle of water?",
+    "Can you pass me the salt, please?",
+    "Can you close the window, please?",
+    "Can you bring me another glass, please?",
+    "Can you take our order, please?",
+    "Can you bring us the bill, please?",
+    "Can you take our plates away, please?",
+    "We'd like to pay by card.",
+    "What do you recommend for a main course?",
+    "What are you having?",
+    "What are you having for dessert?",
+    "I'm having the pie.",
+    "Is it spicy?",
+    "I don't like spicy food.",
+    "Do you have a reservation?",
+    "This way, please.",
+    "Follow me, please.",
+    "Smoking or non-smoking?",
+    "Here is the menu.",
+    "Are you ready to order?",
+    "Can I take your order?",
+    "And for you, Sir (Madam)?",
+    "The pasta comes with a green salad.",
+    "Would you like a drink first?",
+    "Would you like anything else?",
+    "Is everything all right?"
   ],
-  "grammar": [
-    {
-      "name": "Вежливые просьбы: Can/Could you ...? + please",
-      "examples": [
-        "Can you pass me the salt, please?",
-        "Can you take our order, please?",
-        "We'd like to pay by card."
-      ],
-      "interpretation": "В документе указано «Could – более официально и более вежливо» (строка 11); целевая вежливая форма — Could you ..., please? (см. flags)",
-      "origin": "derived",
-      "source_ref": "строки 11-18"
-    },
-    {
-      "name": "Present Continuous — текущие планы: What are you having? / I'm having ...",
-      "examples": [
-        "What are you having?",
-        "What are you having for dessert?",
-        "I'm having the pie."
-      ],
-      "interpretation": "Перевод в документе использует будущее время («Что будете?», «Я буду пирог.») — контраст формы и перевода",
-      "origin": "derived",
-      "source_ref": "строки 22-29"
-    },
-    {
-      "name": "Present Simple — привычки, факты (в т.ч. вопросы)",
-      "examples": [
-        "Он обычно ходит в церковь по воскресеньям.",
-        "Катя отвозит детей в школу каждый день.",
-        "Овощи полезны для тебя."
-      ],
-      "interpretation": "Целевой английский (интерпретация): He usually goes to church on Sundays. / Katya takes the children to school every day. / Vegetables are good for you.",
-      "origin": "derived",
-      "source_ref": "строки 57, 71-72 (перевод предложений)"
-    },
-    {
-      "name": "Past Simple — прошедший опыт",
-      "examples": [
-        "Мы пошли плавать в реке. Вода была очень холодная.",
-        "Ты хочешь посмотреть фото, которые я сделала, когда была в отпуске?"
-      ],
-      "interpretation": "Целевой английский (интерпретация): We went swimming in the river. The water was very cold. / ... the photos that I took when I was on vacation.",
-      "origin": "derived",
-      "source_ref": "строки 54, 60 (перевод предложений)"
-    },
-    {
-      "name": "Модальные can/could — способность и вежливая просьба",
-      "examples": [
-        "Я не могу петь эту песню. Я не знаю слов.",
-        "Извините, можете передать мне соль?"
-      ],
-      "interpretation": "Целевой английский (интерпретация): I can't sing this song. I don't know the words. / Excuse me, could you pass me the salt?",
-      "origin": "derived",
-      "source_ref": "строки 55, 58 (перевод предложений)"
-    },
-    {
-      "name": "like + -ing / want to + глагол (хобби)",
-      "examples": [
-        "Мне нравится фотографировать. Это мое хобби."
-      ],
-      "interpretation": "Целевой английский (интерпретация): I like photographing. It's my hobby.",
-      "origin": "derived",
-      "source_ref": "строки 59-60 (перевод предложений)"
-    },
-    {
-      "name": "Превосходная степень и местоположение (география)",
-      "examples": [
-        "Какой самый большой город в Канаде?",
-        "Перу находится в Южной Америке.",
-        "США находятся между Мексикой и Канадой.",
-        "Мадрид – столица Испании."
-      ],
-      "interpretation": "Целевой английский (интерпретация): What is the biggest city in Canada? / Peru is located in South America. / The USA is between Mexico and Canada. / Madrid is the capital of Spain.",
-      "origin": "derived",
-      "source_ref": "строки 61-63, 65 (перевод предложений)"
-    }
-  ],
-  "exercises": [
-    {
-      "task": "Спросите соседа, что он будет есть (диалог с соседом)",
-      "items": [
-        "What are you having?",
-        "What are you having for dessert?",
-        "Ответ: I'm having the pie. – Я буду пирог."
-      ],
-      "source_ref": "строки 22-29"
-    },
-    {
-      "task": "Перевести предложения",
-      "items": [
-        "Мой любимый вид спорта – футбол.",
-        "Ты любишь какой-нибудь спорт? Да, я играю в баскетбол.",
-        "Мы пошли плавать в реке. Вода была очень холодная.",
-        "Извините, можете передать мне соль?",
-        "Я люблю этот город. Я люблю людей, которые в нем живут.",
-        "Овощи полезны для тебя.",
-        "Я не могу петь эту песню. Я не знаю слов.",
-        "Мне нравится фотографировать. Это мое хобби.",
-        "Ты хочешь посмотреть фото, которые я сделала, когда была в отпуске?",
-        "Мадрид – столица Испании.",
-        "Перу находится в Южной Америке.",
-        "США находятся между Мексикой и Канадой.",
-        "Я бы хотела посетить Альпы.",
-        "Какой самый большой город в Канаде?",
-        "Как называется эта улица?",
-        "Мы живем в деревне в 10 милях от ближайшего города.",
-        "Небо чистое сегодня, мы видим звезды.",
-        "Что ты ел на обед?",
-        "Если у тебя проблемы с зубами – иди к стоматологу.",
-        "Он обычно ходит в церковь по воскресеньям.",
-        "Катя отвозит детей в школу каждый день.",
-        "Ты бы хотела пойти в кино этим вечером?"
-      ],
-      "source_ref": "строки 50-73"
-    }
-  ],
-  "resources": [
-    {
-      "kind": "video",
-      "title": "Разговорные фразы на английском на тему «Ресторан» (Часть 1)",
-      "note": "ссылка — «ниже под данным текстовым документом» (по документу)",
-      "source_ref": "строка 47"
-    },
-    {
-      "kind": "video",
-      "title": "Разговорные фразы на английском на тему «Ресторан» (Часть 2)",
-      "note": "ссылка — «ниже под данным текстовым документом» (по документу)",
-      "source_ref": "строка 47"
-    }
-  ],
-  "flags": [
-    {
-      "text": "Перевод «Would you like some more tea?» — «Вы не хотите еще чаю?»: отрицание «не», вероятно, опечатка в источнике",
-      "location": "строка 4",
-      "reason": "несоответствие перевода"
-    },
-    {
-      "text": "«Smocking or non-smocking?» — вероятно, опечатка для «Smoking or non-smoking?»",
-      "location": "строка 36",
-      "reason": "орфография источника"
-    },
-    {
-      "text": "Заголовок раздела «Could – более официально и более вежливо», но все примеры — «Can ... please?» (и «Can I take your order?» в разделе обслуживания): проверить, какая форма подаётся как более вежливая",
-      "location": "строки 11-18, 40",
-      "reason": "can vs could"
-    },
-    {
-      "text": "«We'd like to pay by card» переведено как «оплатить кредитной картой» — «by card» шире (любая карта)",
-      "location": "строка 18",
-      "reason": "перевод"
-    },
-    {
-      "text": "«Would you like a drink first?» переведено как «Напиток подавать первым?» — перевод меняет смысл",
-      "location": "строка 43",
-      "reason": "несоответствие перевода"
-    },
-    {
-      "text": "Present Continuous «What are you having? / I'm having the pie.» переведено будущим временем («Что будете? / Я буду пирог.») — контраст формы и перевода, вероятно, намеренный; проверить",
-      "location": "строки 24-29",
-      "reason": "форма/перевод"
-    },
-    {
-      "text": "В двух примерах буква «С» в «Сan» — кириллическая (остальные — латиница)",
-      "location": "строки 14, 16",
-      "reason": "опечатка в источнике"
-    },
-    {
-      "text": "Шапка «Выживание за границей / ELEMENTARY / Homework 12» стоит в КОНЦЕ текста, а не в начале; взята для курса, уровня и номера урока",
-      "location": "строки 89-93",
-      "reason": "структура документа"
-    }
+  "words": [
+    "tea",
+    "water",
+    "bottle",
+    "salt",
+    "window",
+    "glass",
+    "toilet",
+    "order",
+    "bill",
+    "plate",
+    "main course",
+    "dessert",
+    "pie",
+    "spicy food",
+    "reservation",
+    "menu",
+    "pasta",
+    "green salad",
+    "drink",
+    "football",
+    "basketball",
+    "swimming",
+    "river",
+    "city",
+    "vegetable",
+    "song",
+    "hobby",
+    "photo",
+    "vacation",
+    "Madrid",
+    "Spain",
+    "Peru",
+    "South America",
+    "USA",
+    "Mexico",
+    "Canada",
+    "Alps",
+    "street",
+    "village",
+    "sky",
+    "star",
+    "lunch",
+    "dentist",
+    "church",
+    "Sunday",
+    "school",
+    "cinema"
   ]
 }
