@@ -25,6 +25,7 @@ from companion.lesson import (
     LEVELS,
     Lesson,
     LessonError,
+    SceneSpec,
     default_lesson_path,
     load_lesson,
     load_lessons,
@@ -53,6 +54,17 @@ def _valid() -> dict:
         "topics": ["Фразы «В ресторане»", "Present Simple"],
         "phrases": ["Can you pass me the salt, please?", "We'd like to pay by card."],
         "words": ["salt", "bill", "pay by card"],
+    }
+
+
+def _scene() -> dict:
+    """Корректная ролевая сцена (все поля)."""
+    return {
+        "id": "hotel_check_in",
+        "name": "Заселение в отель",
+        "teacher_role": "hotel receptionist",
+        "student_role": "hotel guest",
+        "start_message": "Hello! I'd like to check in, please.",
     }
 
 
@@ -135,6 +147,79 @@ class ValidLessonTest(unittest.TestCase):
         data["topics"] = ["одна тема"]
         lesson = load_lesson(_write(data))
         self.assertEqual(lesson.topics, ("одна тема",))
+
+
+class ScenesTest(unittest.TestCase):
+    """Необязательное поле ``scenes``: валидация + реальные уроки."""
+
+    def _error(self, data, *substrings: str) -> str:
+        path = _write(data)
+        with self.assertRaises(LessonError) as ctx:
+            load_lesson(path)
+        message = str(ctx.exception)
+        for substring in substrings:
+            self.assertIn(substring, message)
+        return message
+
+    def test_scenes_absent_defaults_empty(self):
+        lesson = load_lesson(_write(_valid()))
+        self.assertEqual(lesson.scenes, ())
+
+    def test_scene_fields_loaded(self):
+        data = {**_valid(), "scenes": [_scene()]}
+        lesson = load_lesson(_write(data))
+        self.assertEqual(len(lesson.scenes), 1)
+        spec = lesson.scenes[0]
+        self.assertIsInstance(spec, SceneSpec)
+        self.assertEqual(spec.id, "hotel_check_in")
+        self.assertEqual(spec.name, "Заселение в отель")
+        self.assertEqual(spec.teacher_role, "hotel receptionist")
+        self.assertEqual(spec.student_role, "hotel guest")
+        self.assertEqual(spec.start_message, "Hello! I'd like to check in, please.")
+
+    def test_real_homework9_has_hotel_scene(self):
+        lesson = load_lesson(ROOT / "lessons" / "homework9.json")
+        self.assertEqual([s.id for s in lesson.scenes], ["hotel_check_in"])
+        spec = lesson.scenes[0]
+        self.assertEqual(spec.name, "Заселение в отель")
+        self.assertEqual(spec.teacher_role, "hotel receptionist")
+        self.assertEqual(spec.student_role, "hotel guest")
+        self.assertEqual(spec.start_message, "Hello! I'd like to check in, please.")
+
+    def test_real_homework12_has_no_scenes(self):
+        lesson = load_lesson(REAL_LESSON)
+        self.assertEqual(lesson.scenes, ())
+
+    def test_scenes_must_be_list(self):
+        data = {**_valid(), "scenes": _scene()}
+        self._error(data, "scenes")
+
+    def test_scene_item_must_be_object(self):
+        data = {**_valid(), "scenes": ["hotel_check_in"]}
+        self._error(data, "scenes[0]")
+
+    def test_scene_missing_field_reported_with_number(self):
+        broken = {k: v for k, v in _scene().items() if k != "name"}
+        data = {**_valid(), "scenes": [broken]}
+        self._error(data, "scenes[0].name")
+
+    def test_scene_empty_field_rejected(self):
+        scene = _scene()
+        scene["teacher_role"] = "   "
+        data = {**_valid(), "scenes": [scene]}
+        self._error(data, "scenes[0].teacher_role")
+
+    def test_scene_id_unique_per_lesson(self):
+        second = {**_scene(), "name": "Вторая сцена"}
+        data = {**_valid(), "scenes": [_scene(), second]}
+        message = self._error(data, "scenes[1].id")
+        # Ошибка указывает обе сцены (поле и номера).
+        self.assertIn("scenes[0]", message)
+
+    def test_scene_unknown_key_rejected(self):
+        scene = {**_scene(), "extra": "field"}
+        data = {**_valid(), "scenes": [scene]}
+        self._error(data, "scenes[0]", "extra")
 
 
 class ErrorTest(unittest.TestCase):

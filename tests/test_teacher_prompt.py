@@ -43,19 +43,16 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from companion.audio_controller import AudioController  # noqa: E402
 from companion.config import AppConfig  # noqa: E402
-from companion.lesson import Lesson  # noqa: E402
+from companion.lesson import Lesson, SceneSpec  # noqa: E402
 from companion.main_window import MainWindow  # noqa: E402
 from companion.message import Message  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
 from companion.session_controller import SessionController  # noqa: E402
 from companion.stt_engine import SttEngine  # noqa: E402
 from companion.teacher_context import (  # noqa: E402
-    Scene,
     TeacherPromptError,
     build_teacher_context,
     load_teacher_prompt,
-    parse_scene_marker,
-    scene_from_marker,
     teacher_prompt_path,
 )
 from tests.stt_fakes import FakeBackend  # noqa: E402
@@ -87,6 +84,17 @@ def _lesson() -> Lesson:
     )
 
 
+def _scene_spec() -> SceneSpec:
+    """Сцена урока (то, что хранится в ``Lesson.scenes``)."""
+    return SceneSpec(
+        id="hotel_check_in",
+        name="Заселение в отель",
+        teacher_role="hotel receptionist",
+        student_role="hotel guest",
+        start_message="Hello! I'd like to check in, please.",
+    )
+
+
 def _last_system(send_mock: mock.MagicMock) -> str:
     return send_mock.call_args.kwargs["system"]
 
@@ -101,12 +109,13 @@ class TestTeacherPromptFile(unittest.TestCase):
         self.assertIn("no emojis", text)
         self.assertIn("no jokes", text)
         self.assertIn("1-3 sentences", text)
+        self.assertIn("one question", text)
         self.assertIn("I don't know", text)
-        # Режимы разговора и маркер сцены.
-        self.assertIn("[SCENE:free]", text)
-        self.assertIn("propose it first", text)
-        self.assertIn("genuinely struggles", text)
+        # Режимы разговора задаёт приложение (маркера сцены в промпте нет).
+        self.assertIn("Free talk: follow the topic the student chooses", text)
+        self.assertIn("Play that role from the first reply", text)
         self.assertIn("Thanks, that's all", text)
+        self.assertNotIn("[SCENE:", text)
 
     def test_default_path_relative_to_app(self) -> None:
         """Путь — относительно приложения; чужая рабочая папка не ломает
@@ -262,7 +271,7 @@ class TestEditPickedUp(ControllerBase):
 
 
 class TestSceneMode(ControllerBase):
-    """Режим разговора: сцена → свободная беседа → сцена снова."""
+    """Режим разговора: сцену выбирает пользователь (комбо «Сцена»)."""
 
     def test_initial_request_is_free_talk(self) -> None:
         self.assertTrue(self.controller.send_message("hi"))
@@ -270,127 +279,119 @@ class TestSceneMode(ControllerBase):
         self.assertIn("free talk (no role-play scene is active)", system)
         self.assertNotIn("role-play scene is ACTIVE", system)
 
-    def test_scene_marker_sets_scene_and_cleans_reply(self) -> None:
-        added: list[Message] = []
-        self.controller.message_added.connect(added.append)
-        reply = (
-            "You are a guest, I am the hotel receptionist.\n"
-            "[SCENE:hotel check-in|you are the hotel receptionist, "
-            "the student is the guest]"
-        )
-        self.assertTrue(self.controller.send_message("I'm looking for a room"))
-        self.controller.client.chat_completed.emit(reply)
-        _pump(0.02)
-
+    def test_select_scene_sends_start_message_once_with_scene_context(self) -> None:
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        # На одно переключение — ровно один запрос.
+        self.send_mock.assert_called_once()
+        args, kwargs = self.send_mock.call_args
+        # Стартовая реплика — как обычная реплика пользователя (в чате — «You»).
         self.assertEqual(
-            self.controller.scene,
-            Scene(
-                name="hotel check-in",
-                roles="you are the hotel receptionist, the student is the guest",
-            ),
+            [m.content for m in args[1]], [spec.start_message]
         )
-        # Маркер убран: и в истории, и в сигнале окна.
-        answer = self.controller.history[-1]
-        self.assertEqual(answer.role, "assistant")
-        self.assertNotIn("[SCENE:", answer.content)
-        self.assertEqual(answer.content, "You are a guest, I am the hotel receptionist.")
-        self.assertEqual(
-            added[-1].content, "You are a guest, I am the hotel receptionist."
-        )
-
-    def test_next_request_carries_scene_and_roles(self) -> None:
-        reply = (
-            "Welcome!\n"
-            "[SCENE:hotel check-in|you are the hotel receptionist, "
-            "the student is the guest]"
-        )
-        self.assertTrue(self.controller.send_message("I'm looking for a room"))
-        self.controller.client.chat_completed.emit(reply)
-        _pump(0.02)
-        self.assertTrue(self.controller.send_message("How much is the room?"))
-        system = _last_system(self.send_mock)
+        # Учитель получает активную сцену и ОБЕ роли уже с первого запроса.
+        system = kwargs["system"]
         self.assertIn("role-play scene is ACTIVE", system)
-        self.assertIn("Scene: hotel check-in", system)
-        self.assertIn("you are the hotel receptionist, the student is the guest",
-                      system)
-
-    def test_exit_to_free_talk_keeps_history_and_material(self) -> None:
-        # Сцена активна.
-        reply = (
-            "You are a guest, I am the receptionist.\n"
-            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]"
+        self.assertIn("Scene: Заселение в отель", system)
+        self.assertIn("hotel receptionist", system)
+        self.assertIn("hotel guest", system)
+        # Сцена установлена; стартовая реплика в истории/в работе.
+        self.assertEqual(self.controller.scene, spec)
+        self.assertEqual(
+            self.controller.pending_message, Message("user", spec.start_message)
         )
+        self.assertTrue(self.controller.busy)
+
+    def test_select_scene_keeps_existing_history(self) -> None:
+        spec = _scene_spec()
+        # Непустая история — сохраняется при переключении сцены.
         self.assertTrue(self.controller.send_message("I'm looking for a room"))
-        self.controller.client.chat_completed.emit(reply)
+        self.controller.client.chat_completed.emit("Welcome to the hotel.")
+        _pump(0.02)
+        self.assertEqual(len(self.controller.history), 2)
+
+        self.assertTrue(self.controller.select_scene(spec))
+        args, kwargs = self.send_mock.call_args
+        # История + стартовая реплика сцены — в одном запросе.
+        self.assertEqual(
+            [m.content for m in args[1]],
+            ["I'm looking for a room", "Welcome to the hotel.", spec.start_message],
+        )
+        self.assertIn("role-play scene is ACTIVE", kwargs["system"])
+
+    def test_clear_scene_ends_scene_without_reply(self) -> None:
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        self.controller.client.chat_completed.emit("Welcome to the hotel.")
         _pump(0.02)
         self.assertIsNotNone(self.controller.scene)
 
-        # Ученик завершает сцену.
-        exit_reply = "Sure — tell me about your trip.\n[SCENE:free]"
-        self.assertTrue(
-            self.controller.send_message("Thanks, that's all. Let's talk about my trip.")
-        )
-        self.controller.client.chat_completed.emit(exit_reply)
-        _pump(0.02)
-
+        # «Свободная беседа»: сцена завершается сразу, БЕЗ автоматической реплики.
+        history_before = list(self.controller.history)
+        self.controller.clear_scene()
         self.assertIsNone(self.controller.scene)
-        # История сохранена целиком (4 реплики), маркер нигде нет.
-        self.assertEqual(len(self.controller.history), 4)
-        for message in self.controller.history:
-            self.assertNotIn("[SCENE:", message.content)
-        self.assertNotIn(
-            "[SCENE:",
-            self.controller.history[-1].content,
-        )
-        # Следующий запрос: свободная беседа, без сцены/ролей;
-        # учебный материал — на месте.
-        self.assertTrue(self.controller.send_message("I went to the mountains."))
+        self.assertEqual(self.controller.history, history_before)
+        self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
+
+        # Следующий запрос — свободная беседа; история и материал сохранены.
+        self.assertTrue(self.controller.send_message("Tell me about your trip."))
         system = _last_system(self.send_mock)
         self.assertIn("free talk (no role-play scene is active)", system)
         self.assertNotIn("role-play scene is ACTIVE", system)
-        self.assertNotIn("hotel check-in", system)
+        self.assertNotIn("Заселение в отель", system)
         self.assertIn("Урок 9", system)
         self.assertIn("reservation", system)
 
-    def test_restart_scene_after_free_talk(self) -> None:
-        # Свободная беседа: ученик снова просит сцену.
-        self.assertTrue(self.controller.send_message("Can we play the hotel scene again?"))
-        restart_reply = (
-            "Of course — you are a guest, I am the receptionist.\n"
-            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]"
+    def test_model_reply_does_not_change_scene(self) -> None:
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        # Ответ модели «завершает сцену» (маркер из старой модели) — сцену
+        # это НЕ меняет: режим — явный выбор пользователя.
+        self.controller.client.chat_completed.emit(
+            "Thanks, that's all.\n[SCENE:free]"
         )
-        self.controller.client.chat_completed.emit(restart_reply)
         _pump(0.02)
-        self.assertIsNotNone(self.controller.scene)
-        self.assertTrue(self.controller.send_message("Hello!"))
+        self.assertEqual(self.controller.scene, spec)
+        # Следующий запрос — сцена по-прежнему активна.
+        self.assertTrue(self.controller.send_message("Goodbye!"))
         system = _last_system(self.send_mock)
         self.assertIn("role-play scene is ACTIVE", system)
-        self.assertIn("Scene: hotel check-in", system)
+        self.assertIn(spec.teacher_role, system)
+        self.assertIn(spec.student_role, system)
 
-    def test_missing_marker_keeps_state(self) -> None:
-        # Свободная беседа + ответ без маркера — состояние не меняется.
-        self.assertTrue(self.controller.send_message("hi"))
-        self.controller.client.chat_completed.emit("Hello! How can I help?")
+    def test_select_scene_prompt_error_keeps_previous_scene(self) -> None:
+        spec_a = _scene_spec()
+        spec_b = SceneSpec(
+            id="airport",
+            name="В аэропорту",
+            teacher_role="check-in clerk",
+            student_role="passenger",
+            start_message="Hello, I have a reservation.",
+        )
+        self.assertTrue(self.controller.select_scene(spec_a))
+        self.controller.client.chat_completed.emit("Sure, what name?")
         _pump(0.02)
+
+        # Файл промпта не читается: переключение НЕ начинается.
+        os.remove(self.prompt_file)
+        self.assertFalse(self.controller.select_scene(spec_b))
+        self.send_mock.assert_called_once()
+        # Прежняя сцена восстановлена; причина — в статусе (с путём).
+        self.assertEqual(self.controller.scene, spec_a)
+        self.assertIn(self.prompt_file, self.controller.status)
+
+    def test_select_scene_while_busy_rejected(self) -> None:
+        spec = _scene_spec()
+        self.assertTrue(self.controller.send_message("hi"))
+        self.assertTrue(self.controller.busy)
+        # Во время операции переключение блокируется (как смена урока).
+        self.assertFalse(self.controller.select_scene(spec))
         self.assertIsNone(self.controller.scene)
 
-        # Сцена активна + ответ без маркера — сцена не сбрасывается.
-        self.assertTrue(self.controller.send_message("I'm looking for a room"))
-        self.controller.client.chat_completed.emit(
-            "Welcome!\n[SCENE:hotel check-in|you are the receptionist, the student is the guest]"
-        )
-        _pump(0.02)
-        scene = self.controller.scene
-        self.assertTrue(self.controller.send_message("Breakfast?"))
-        self.controller.client.chat_completed.emit("Breakfast is from 7 to 10.")
-        _pump(0.02)
-        self.assertEqual(self.controller.scene, scene)
-
     def test_reset_history_clears_scene(self) -> None:
-        self.assertTrue(self.controller.send_message("I'm looking for a room"))
-        self.controller.client.chat_completed.emit(
-            "Welcome!\n[SCENE:hotel check-in|you are the receptionist, the student is the guest]"
-        )
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        self.controller.client.chat_completed.emit("Welcome to the hotel.")
         _pump(0.02)
         self.assertIsNotNone(self.controller.scene)
         self.controller.reset_history()
@@ -400,94 +401,61 @@ class TestSceneMode(ControllerBase):
 
 
 class TestSceneRewrite(ControllerBase):
-    """Перезапись реплики: сцена восстанавливается до исходного обмена."""
+    """Перезапись реплики: активная сцена (явный выбор) сохраняется."""
 
-    def _complete(self, user_text: str, reply_text: str) -> None:
-        self.assertTrue(self.controller.send_message(user_text))
-        self.controller.client.chat_completed.emit(reply_text)
+    def test_rewrite_start_message_keeps_scene_and_roles(self) -> None:
+        """Перезапись СТАРТОВОЙ реплики сцены: роли сохраняются."""
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        self.controller.client.chat_completed.emit("Welcome to the hotel!")
         _pump(0.02)
+        self.assertEqual(self.controller.scene, spec)
 
-    def test_rewrite_uses_free_after_scene_reply(self) -> None:
-        """Свободная беседа → сцена: замена несёт СВОБОДНУЮ беседу."""
-        self._complete(
-            "I'm looking for a room",
-            "You are a guest, I am the receptionist.\n"
-            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]",
+        # Перезапись не отменяет явный выбор пользователя в комбо.
+        self.assertTrue(
+            self.controller.replace_last_user_message("Hello, I need to check in.")
         )
-        self.assertIsNotNone(self.controller.scene, "ответ установил сцену")
-
-        # Удаляемый ответ мог сменить сцену — используем сцену ДО обмена.
-        self.assertTrue(self.controller.replace_last_user_message("I need a room"))
-        system = _last_system(self.send_mock)
-        self.assertIn("free talk (no role-play scene is active)", system)
-        self.assertNotIn("role-play scene is ACTIVE", system)
-        # Сцена контроллера восстановлена до обмена (удалённый ответ не в силе).
-        self.assertIsNone(self.controller.scene)
-        # Ответ без маркера сцену не меняет.
-        self.controller.client.chat_completed.emit("Sure. How many nights?")
-        _pump(0.02)
-        self.assertIsNone(self.controller.scene)
-
-    def test_rewrite_uses_scene_after_free_reply(self) -> None:
-        """Сцена → свободная беседа: замена несёт АКТИВНУЮ сцену."""
-        self._complete(
-            "I'm looking for a room",
-            "You are a guest, I am the receptionist.\n"
-            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]",
-        )
-        self.assertIsNotNone(self.controller.scene)
-        # Второй ход в сцене; ответ завершает её (свободная беседа).
-        self._complete(
-            "What is the price?",
-            "It is fifty dollars. Thanks, that's all.\n[SCENE:free]",
-        )
-        self.assertIsNone(self.controller.scene, "ответ завершил сцену")
-
-        # Перезапись второго хода: сцена ДО обмена была АКТИВНА.
-        self.assertTrue(self.controller.replace_last_user_message("How much is it?"))
         system = _last_system(self.send_mock)
         self.assertIn("role-play scene is ACTIVE", system)
-        self.assertIn("Scene: hotel check-in", system)
-        self.assertNotIn("free talk (no role-play scene is active)", system)
-        # Сцена контроллера восстановлена до обмена.
-        self.assertIsNotNone(self.controller.scene)
-        self.assertEqual(self.controller.scene.name, "hotel check-in")
+        self.assertIn(spec.teacher_role, system)
+        self.assertIn(spec.student_role, system)
+        self.assertEqual(self.controller.scene, spec)
+        # Стартовая реплика заменена (без дубля).
+        self.assertEqual(
+            self.controller.pending_message,
+            Message("user", "Hello, I need to check in."),
+        )
 
     def test_rewrite_prompt_error_preserves_history_and_scene(self) -> None:
         """Сбой чтения промпта: история и сцена сохраняются, запрос не ушёл."""
-        self._complete(
-            "I'm looking for a room",
-            "You are a guest.\n[SCENE:hotel check-in|you are the receptionist]",
-        )
-        self.assertIsNotNone(self.controller.scene)
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        self.controller.client.chat_completed.emit("Welcome to the hotel!")
+        _pump(0.02)
+        self.assertEqual(self.controller.scene, spec)
         history_before = list(self.controller.history)
-        scene_before = self.controller.scene
 
         os.remove(self.prompt_file)
         self.assertFalse(self.controller.replace_last_user_message("I need a room"))
         self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
         # История и сцена не тронуты.
         self.assertEqual(self.controller.history, history_before)
-        self.assertEqual(self.controller.scene, scene_before)
+        self.assertEqual(self.controller.scene, spec)
 
-    def test_retry_after_failed_rewrite_uses_restored_scene(self) -> None:
-        """Замена прошла, запрос упал — повтор несёт восстановленную сцену."""
-        self._complete(
-            "I'm looking for a room",
-            "You are a guest.\n[SCENE:hotel check-in|you are the receptionist]",
-        )
-        self.assertIsNotNone(self.controller.scene)
-        # Перезапись: сцена ДО обмена = свободная беседа.
-        self.assertTrue(self.controller.replace_last_user_message("I need a room"))
-        self.assertIsNone(self.controller.scene)
+    def test_retry_after_failed_request_keeps_scene(self) -> None:
+        """Запрос сцены упал — повтор несёт ту же (активную) сцену."""
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
         # Новый запрос упал: реплика сохранена для повтора.
         self.controller.client.chat_failed.emit("timeout")
         self.assertIsNotNone(self.controller.retry_message)
-        # Повтор — восстановленная (свободная) сцена.
+        # Повтор — с активной сценой и её ролями.
         self.assertTrue(self.controller.retry_last_user_message())
         system = _last_system(self.send_mock)
-        self.assertIn("free talk (no role-play scene is active)", system)
-        self.assertNotIn("role-play scene is ACTIVE", system)
+        self.assertIn("role-play scene is ACTIVE", system)
+        self.assertIn(spec.teacher_role, system)
+        self.assertIn(spec.student_role, system)
+        self.assertEqual(self.controller.scene, spec)
 
 
 class TestModelSigning(ControllerBase):
@@ -542,57 +510,8 @@ class TestNewSessionClearsRequestState(ControllerBase):
         self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
 
 
-class TestMarkerHelpers(unittest.TestCase):
-    """parse_scene_marker / scene_from_marker — юнит-проверки."""
-
-    def test_marker_last_line_removed(self) -> None:
-        clean, marker = parse_scene_marker(
-            "Goodbye!\n[SCENE:free]"
-        )
-        self.assertEqual(clean, "Goodbye!")
-        self.assertEqual(marker, "free")
-
-    def test_marker_with_roles(self) -> None:
-        clean, marker = parse_scene_marker(
-            "You are a guest.\n"
-            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]"
-        )
-        self.assertEqual(clean, "You are a guest.")
-        self.assertEqual(
-            scene_from_marker(marker),
-            Scene(
-                name="hotel check-in",
-                roles="you are the receptionist, the student is the guest",
-            ),
-        )
-
-    def test_marker_not_last_line_untouched(self) -> None:
-        text = "Look: [SCENE:free] and more"
-        clean, marker = parse_scene_marker(text)
-        self.assertEqual(clean, text)
-        self.assertIsNone(marker)
-
-    def test_no_marker(self) -> None:
-        clean, marker = parse_scene_marker("just text")
-        self.assertEqual(clean, "just text")
-        self.assertIsNone(marker)
-
-    def test_scene_from_marker_variants(self) -> None:
-        self.assertIsNone(scene_from_marker(None))
-        self.assertIsNone(scene_from_marker(""))
-        self.assertIsNone(scene_from_marker("free"))
-        self.assertIsNone(scene_from_marker("  FREE  "))
-        self.assertEqual(
-            scene_from_marker("hotel check-in"), Scene(name="hotel check-in", roles="")
-        )
-        self.assertEqual(
-            scene_from_marker("hotel check-in | roles here"),
-            Scene(name="hotel check-in", roles="roles here"),
-        )
-
-
 class TestWindowIntegration(ControllerBase):
-    """Окно: маркер не виден и не озвучен; ошибка файла — с путём."""
+    """Окно: выбор сцены + авто-старт; ошибка файла промпта — с путём."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -614,25 +533,71 @@ class TestWindowIntegration(ControllerBase):
             del self.window
             super().tearDown()
 
-    def test_reply_marker_hidden_from_chat_and_speech(self) -> None:
-        self.window.message_input.setText("I'm looking for a room")
-        self.window.send_message()
-        _pump(0.05)
-        self.controller.client.chat_completed.emit(
-            "You are a guest, I am the hotel receptionist.\n"
-            "[SCENE:hotel check-in|you are the hotel receptionist, "
-            "the student is the guest]"
-        )
-        _pump(0.05)
+    def test_scene_combo_lists_lesson_scenes(self) -> None:
+        """Комбо «Сцена»: «Свободная беседа» + сцены выбранного урока (Урок 9)."""
+        combo = self.window.scene_combo
+        lesson = self.controller.lesson
+        self.assertIsNotNone(lesson)
+        self.assertEqual(combo.itemText(0), "Свободная беседа")
+        self.assertIsNone(combo.itemData(0))
+        for i, spec in enumerate(lesson.scenes, start=1):
+            self.assertEqual(combo.itemText(i), spec.name)
+            self.assertIs(combo.itemData(i), spec)
+        self.assertEqual(combo.currentIndex(), 0)
 
-        text = self.window.history.toPlainText()
-        self.assertIn("You are a guest, I am the hotel receptionist.", text)
-        self.assertNotIn("[SCENE:", text)
+    def test_select_scene_starts_scene_and_shows_start_message(self) -> None:
+        combo = self.window.scene_combo
+        spec = combo.itemData(1)
+        self.assertIsNotNone(spec)
+        self.controller.selected_model = "m"
+        combo.setCurrentIndex(1)
+        _pump(0.05)
+        # Ровно один запрос; стартовая реплика — как обычная реплика «You».
+        self.send_mock.assert_called_once()
+        chat = self.window.history.toPlainText()
+        self.assertIn(f"You: {spec.start_message}", chat)
+        self.assertIn("role-play scene is ACTIVE", _last_system(self.send_mock))
+        self.assertIsNotNone(self.controller.scene)
+        # Ответ показан и озвучен; сцена сохранена.
+        self.controller.client.chat_completed.emit("Welcome to the hotel!")
+        _pump(0.05)
+        self.assertIn("Teacher", self.window.history.toPlainText())
         self.assertEqual(self.audio.speak_reply.call_count, 1)
-        self.assertEqual(
-            self.audio.speak_reply.call_args[0][0],
-            "You are a guest, I am the hotel receptionist.",
-        )
+        self.assertIsNotNone(self.controller.scene)
+
+    def test_free_talk_selection_clears_scene_without_reply(self) -> None:
+        combo = self.window.scene_combo
+        spec = combo.itemData(1)
+        self.assertIsNotNone(spec)
+        self.controller.selected_model = "m"
+        combo.setCurrentIndex(1)
+        self.controller.client.chat_completed.emit("Welcome to the hotel!")
+        _pump(0.05)
+        self.assertIsNotNone(self.controller.scene)
+        history_before = list(self.controller.history)
+        # «Свободная беседа» — сцена завершается сразу, без автоматической реплики.
+        combo.setCurrentIndex(0)
+        _pump(0.05)
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.controller.history, history_before)
+
+    def test_prompt_error_restores_scene_combo_and_scene(self) -> None:
+        combo = self.window.scene_combo
+        self.controller.selected_model = "m"
+        os.remove(self.prompt_file)
+        combo.setCurrentIndex(1)
+        _pump(0.05)
+        # Отправку начать нельзя: прежний пункт и прежняя сцена.
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertEqual(self.controller.history, [])
+        self.assertIn(self.prompt_file, self.window.status_label.text())
+        self.send_mock.assert_not_called()
+        # После исправления файла выбор сцены работает (один запрос).
+        self._write_prompt("DELTA RULE — teach well.")
+        combo.setCurrentIndex(1)
+        _pump(0.05)
+        self.send_mock.assert_called_once()
         self.assertIsNotNone(self.controller.scene)
 
     def test_prompt_error_shown_with_path_and_input_kept(self) -> None:

@@ -16,35 +16,25 @@ Ollama вместе с историей разговора (поле ``system``)
 
 Состав системного сообщения:
 * текст файла (идентичность + учебные и языковые правила + правила
-  режимов разговора и маркера сцены);
+  режимов разговора);
 * блок урока: ``Lesson: name``, ``Student level``, темы, фразы, слова
   (материал ученика);
-* актуальный режим разговора: сцена активна — её имя и роли, иначе —
-  свободная беседа. Состояние сцены хранит и определяет
-  ``SessionController`` (по маркеру ``[SCENE:...]`` в ответе
-  преподавателя; маркер из ответа убирается — в чат, озвучивание и
-  историю не попадает).
+* актуальный режим разговора: сцена активна — её имя (``SceneSpec.name``)
+  и ОБЕ РОЛИ (``teacher_role``/``student_role``), иначе — свободная
+  беседа. Режим — явный выбор пользователя (комбо «Сцена»), состояние
+  хранит ``SessionController`` (``select_scene``/``clear_scene``); ответ
+  модели режим НЕ меняет.
 """
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
 from pathlib import Path
 
-from .lesson import Lesson
+from .lesson import Lesson, SceneSpec
 
 
 class TeacherPromptError(ValueError):
     """Файл промпта преподавателя отсутствует, пуст или не читается."""
-
-
-@dataclass(frozen=True)
-class Scene:
-    """Активная ролевая сцена; ``roles`` — свободный текст ролей."""
-
-    name: str
-    roles: str = ""
 
 
 def teacher_prompt_path() -> Path:
@@ -79,7 +69,7 @@ def load_teacher_prompt(path: str | Path | None = None) -> str:
 
 def build_teacher_context(
     lesson: Lesson,
-    scene: Scene | None = None,
+    scene: SceneSpec | None = None,
     prompt_path: str | Path | None = None,
 ) -> str:
     """Системный контекст для Ollama: промпт файла + урок + режим.
@@ -87,6 +77,9 @@ def build_teacher_context(
     Промпт читается из файла ПЕРЕД каждым запросом (``{level}``
     подставляется уровнем урока). Чистая функция: без Qt и сети —
     легко проверять в тестах.
+
+    ``scene`` — активная ролевая сцена урока (``SceneSpec``); ``None`` —
+    свободная беседа. Сцена передаёт имя и ОБЕ роли (учитель/ученик).
     """
     text = load_teacher_prompt(prompt_path).replace("{level}", lesson.level)
     lines: list[str] = [text.rstrip(), ""]
@@ -108,55 +101,21 @@ def build_teacher_context(
     if scene is not None:
         lines.append("Conversation mode: role-play scene is ACTIVE.")
         lines.append(f"Scene: {scene.name}")
-        if scene.roles:
-            lines.append(f"Roles: {scene.roles}")
+        lines.append(f"Your role: {scene.teacher_role}")
+        lines.append(f"Student role: {scene.student_role}")
         lines.append(
-            "Keep the roles and the situation while the scene is active; "
-            "the scene ends only when the student clearly finishes it."
+            "Play your role from the first reply. Let the student formulate "
+            "their own lines: respond to what they say and keep the situation "
+            "moving with new facts and short questions."
+        )
+        lines.append(
+            "Keep the roles while the scene is active; the scene ends only "
+            "when the student clearly finishes it."
         )
     else:
         lines.append(
             "Conversation mode: free talk (no role-play scene is active). "
-            "Continue as the teacher-conversation partner; the student's "
-            "topic may be discussed."
+            "Follow the topic the student chooses; use lesson vocabulary "
+            "when it fits their topic."
         )
     return "\n".join(lines)
-
-
-#: Маркер сцены — последняя непустая строка ответа преподавателя.
-_SCENE_MARKER = re.compile(r"^\[SCENE:(.+?)\]$")
-
-
-def parse_scene_marker(text: str) -> tuple[str, str | None]:
-    """Возвращает ``(текст_без_маркера, маркер_или_None)``.
-
-    Маркер — последняя непустая строка вида ``[SCENE:...]``:
-    ``free`` (свободная беседа) или ``<имя>|<роли>`` (сцена активна).
-    Из ответа маркер убирается: в чат, озвучивание и историю он не
-    попадает. Маркер не на последней строке (или отсутствует) —
-    текст возвращается как есть.
-    """
-    lines = text.splitlines()
-    marker: str | None = None
-    for i in range(len(lines) - 1, -1, -1):
-        if not lines[i].strip():
-            continue
-        match = _SCENE_MARKER.match(lines[i].strip())
-        if match:
-            marker = match.group(1).strip()
-            del lines[i]
-        break
-    return "\n".join(lines), marker
-
-
-def scene_from_marker(marker: str | None) -> Scene | None:
-    """``free``/пусто/отсутствует → ``None`` (свободная беседа);
-    иначе ``Scene(name, roles)`` (``name|roles`` разбивается по
-    первому ``|``)."""
-    if not marker:
-        return None
-    name, _, roles = marker.partition("|")
-    name = name.strip()
-    if not name or name.lower() == "free":
-        return None
-    return Scene(name=name, roles=roles.strip())

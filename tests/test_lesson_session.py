@@ -40,6 +40,7 @@ from companion.config import AppConfig  # noqa: E402
 from companion.lesson import (  # noqa: E402
     Lesson,
     LessonError,
+    SceneSpec,
     default_lesson_path,
     load_lesson,
     load_lessons,
@@ -48,7 +49,10 @@ from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
 from companion.session_controller import SessionController  # noqa: E402
 from companion.stt_engine import SttEngine  # noqa: E402
-from companion.teacher_context import Scene, build_teacher_context  # noqa: E402
+from companion.teacher_context import (  # noqa: E402
+    TeacherPromptError,
+    build_teacher_context,
+)
 from tests.stt_fakes import FakeBackend  # noqa: E402
 
 _QAPP: "QApplication | None" = None
@@ -168,13 +172,34 @@ class TestTeacherContext(unittest.TestCase):
         )
         self.assertIn("natural for your role", context)
 
-    def test_context_roles_situation_and_questions(self) -> None:
-        """Роли и место; преподаватель задаёт факты; вопросы — только
-        на сообщённые сведения, предпочтения или действие ученика."""
+    def test_context_scene_roles_and_start(self) -> None:
+        """Сцена (из урока): роль преподавателя, роль ученика, старт с
+        первой реплики; свободная беседа — тема ученика."""
+        lesson = load_lesson(default_lesson_path())
+        # Свободная беседа: учитель следует теме ученика.
+        free = build_teacher_context(lesson)
+        self.assertIn("follow the topic the student chooses", free)
+        self.assertNotIn("role-play scene is ACTIVE", free)
+        # Активная сцена: имя + ОБЕ РОЛИ + старт с первой реплики.
+        scene = SceneSpec(
+            id="hotel_check_in",
+            name="Заселение в отель",
+            teacher_role="hotel receptionist",
+            student_role="hotel guest",
+            start_message="Hello! I'd like to check in, please.",
+        )
+        ctx = build_teacher_context(lesson, scene=scene)
+        self.assertIn("role-play scene is ACTIVE", ctx)
+        self.assertIn("Scene: Заселение в отель", ctx)
+        self.assertIn("Your role: hotel receptionist", ctx)
+        self.assertIn("Student role: hotel guest", ctx)
+        self.assertIn("Play that role from the first reply", ctx)
+
+    def test_context_situation_facts_and_questions(self) -> None:
+        """Преподаватель задаёт факты; вопросы — только на сообщённые
+        сведения, предпочтения или действие ученика."""
         lesson = load_lesson(default_lesson_path())
         context = build_teacher_context(lesson)
-        self.assertIn("briefly set the roles and the place", context)
-        self.assertIn("Keep the roles until the situation clearly ends", context)
         self.assertIn("You provide the invented facts of the situation", context)
         self.assertIn("prices, breakfast time, room availability", context)
         self.assertIn("their preferences, or an action they can take", context)
@@ -369,7 +394,7 @@ class TestOllamaPayload(LessonSessionBase):
         self.assertIn("1-3 sentences", system_text)
         # Правила учебного поведения дошли до Ollama (подмена сети).
         self.assertIn("the student's practice material", system_text)
-        self.assertIn("set the roles and the place", system_text)
+        self.assertIn("Play that role from the first reply", system_text)
         self.assertIn("You provide the invented facts", system_text)
         # После системного сообщения — текущая история (на момент запроса
         # это реплика пользователя; ответ придёт позже — см. второй ход).
@@ -527,8 +552,12 @@ class TestLessonChangeCancel(LessonSessionBase):
     def test_lesson_change_cancelled_restores_combo(self) -> None:
         original = self.controller.lesson
         self._exchange()
-        self.controller.scene = Scene(
-            name="hotel check-in", roles="you are the receptionist"
+        self.controller.scene = SceneSpec(
+            id="hotel_check_in",
+            name="Заселение в отель",
+            teacher_role="hotel receptionist",
+            student_role="hotel guest",
+            start_message="Hello!",
         )
         lesson = self._second_lesson()
         question = mock.MagicMock(return_value=QMessageBox.StandardButton.No)
@@ -540,10 +569,188 @@ class TestLessonChangeCancel(LessonSessionBase):
         self.assertIs(self.window.lesson_combo.currentData(), original)
         # История и сцена сохранены.
         self.assertEqual(len(self.controller.history), 2)
+        self.assertIsNotNone(self.controller.scene)
+        self.assertEqual(self.controller.scene.name, "Заселение в отель")
+
+
+class TestSceneSelection(LessonSessionBase):
+    """Комбо «Сцена»: список, авто-старт одним запросом, свободная беседа,
+    сброс при новом занятии/смене урока, блокировки и ошибки промпта."""
+
+    def _first_lesson(self) -> Lesson:
+        """Урок 9 — первая позиция комбо (со сценой)."""
+        lesson = self.window.lesson_combo.itemData(0)
+        self.assertEqual(lesson.id, "hw9")
+        self.assertTrue(lesson.scenes)
+        return lesson
+
+    def test_scene_combo_lists_lesson_scenes(self) -> None:
+        lesson = self._first_lesson()
+        combo = self.window.scene_combo
+        self.assertEqual(combo.itemText(0), "Свободная беседа")
+        self.assertIsNone(combo.itemData(0))
+        self.assertEqual(combo.count(), 1 + len(lesson.scenes))
+        for i, spec in enumerate(lesson.scenes, start=1):
+            self.assertEqual(combo.itemText(i), spec.name)
+            self.assertIs(combo.itemData(i), spec)
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertIsNone(self.controller.scene)
+        self.assertTrue(combo.isEnabled(), "свободные операции — комбо активно")
+
+    def test_select_scene_starts_scene_single_request(self) -> None:
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        self.assertEqual(spec.id, "hotel_check_in")
+        send_mock = self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        _pump(0.1)
+        # Ровно один запрос на переключение.
+        send_mock.assert_called_once()
+        system = send_mock.call_args.kwargs["system"]
+        self.assertIn("role-play scene is ACTIVE", system)
+        self.assertIn("Scene: Заселение в отель", system)
+        self.assertIn(spec.teacher_role, system)
+        self.assertIn(spec.student_role, system)
+        # Стартовая реплика — как обычная реплика пользователя («You»).
         self.assertEqual(
-            self.controller.scene,
-            Scene(name="hotel check-in", roles="you are the receptionist"),
+            [m.content for m in send_mock.call_args.args[1]], [spec.start_message]
         )
+        self.assertIn(f"You: {spec.start_message}", self.window.history.toPlainText())
+        self.assertEqual(self.controller.scene, spec)
+
+    def test_select_scene_keeps_existing_history(self) -> None:
+        self._exchange()  # непустая история
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        send_mock = self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        _pump(0.1)
+        self.assertEqual(
+            [m.content for m in send_mock.call_args.args[1]],
+            ["Hello!", "Hi! How are you?", spec.start_message],
+        )
+        self.assertIn("role-play scene is ACTIVE",
+                      send_mock.call_args.kwargs["system"])
+
+    def test_free_talk_selection_clears_scene_without_reply(self) -> None:
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        self.controller.client.chat_completed.emit("Welcome to the hotel!")
+        _pump(0.1)
+        self.assertEqual(self.controller.scene, spec)
+        history_before = list(self.controller.history)
+        self.window.scene_combo.setCurrentIndex(0)
+        _pump(0.1)
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.controller.history, history_before, "без новой реплики")
+        # Следующий запрос — свободная беседа.
+        self.assertTrue(self.controller.send_message("Tell me about your trip."))
+        system = self.controller.client.send_chat.call_args.kwargs["system"]
+        self.assertIn("free talk (no role-play scene is active)", system)
+
+    def test_model_reply_does_not_change_scene(self) -> None:
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        # Ответ модели «завершает сцену» — сцену это НЕ меняет.
+        self.controller.client.chat_completed.emit("Thanks, that's all.")
+        _pump(0.1)
+        self.assertEqual(self.controller.scene, spec)
+        # Следующий запрос — сцена по-прежнему активна.
+        self.assertTrue(self.controller.send_message("Goodbye!"))
+        system = self.controller.client.send_chat.call_args.kwargs["system"]
+        self.assertIn("role-play scene is ACTIVE", system)
+        self.assertIn(spec.teacher_role, system)
+
+    def test_scene_switch_blocked_while_operation_in_flight(self) -> None:
+        """Пока ожидается ответ — смена сцены заблокирована (как смена урока)."""
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        self.assertTrue(self.controller.busy)
+        self.assertFalse(self.window.scene_combo.isEnabled())
+        self.assertFalse(self.window.new_session_button.isEnabled())
+        # После завершения ответа — снова доступно.
+        self.controller.client.chat_completed.emit("Welcome!")
+        _pump(0.1)
+        self.assertTrue(self.window.scene_combo.isEnabled())
+
+    def test_prompt_error_restores_combo_and_scene(self) -> None:
+        lesson = self._first_lesson()
+        spec = lesson.scenes[0]
+        self._allow_send()
+        error = TeacherPromptError(
+            f"Файл промпта преподавателя не найден: {lesson.id}/teacher.txt"
+        )
+        with mock.patch(
+            "companion.teacher_context.load_teacher_prompt", side_effect=error
+        ):
+            self.window.scene_combo.setCurrentIndex(1)
+        _pump(0.1)
+        # Отправку начать нельзя: прежняя сцена и прежний пункт списка.
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.window.scene_combo.currentIndex(), 0)
+        self.assertEqual(self.controller.history, [])
+        self.assertIn("teacher.txt", self.window.status_label.text())
+
+    def test_lesson_change_resets_scene(self) -> None:
+        lesson9 = self._first_lesson()
+        spec = lesson9.scenes[0]
+        self._exchange()  # непустая история → смена урока = новое занятие
+        self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        self.controller.client.chat_completed.emit("Welcome!")
+        _pump(0.1)
+        self.assertEqual(self.controller.scene, spec)
+        # Урок 12 (нет сцен) — берём объект из комбо.
+        lesson12 = None
+        for i in range(self.window.lesson_combo.count()):
+            if self.window.lesson_combo.itemData(i).id == "hw12":
+                lesson12 = self.window.lesson_combo.itemData(i)
+                break
+        self.assertIsNotNone(lesson12)
+        self.assertEqual(lesson12.scenes, ())
+        question = mock.MagicMock(return_value=QMessageBox.StandardButton.Yes)
+        with mock.patch("companion.main_window.QMessageBox.question", question):
+            self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson12))
+        _pump(0.1)
+        self.assertIs(self.controller.lesson, lesson12)
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.window.scene_combo.currentIndex(), 0)
+        self.assertEqual(self.window.scene_combo.count(), 1)
+        self.assertEqual(self.window.scene_combo.itemText(0), "Свободная беседа")
+
+    def test_new_session_resets_scene_combo(self) -> None:
+        lesson9 = self._first_lesson()
+        spec = lesson9.scenes[0]
+        self._exchange()
+        self._allow_send()
+        self.window.scene_combo.setCurrentIndex(1)
+        self.controller.client.chat_completed.emit("Welcome!")
+        _pump(0.1)
+        self.assertEqual(self.controller.scene, spec)
+        question = mock.MagicMock(return_value=QMessageBox.StandardButton.Yes)
+        with mock.patch("companion.main_window.QMessageBox.question", question):
+            self.window.on_new_session()
+        _pump(0.1)
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.window.scene_combo.currentIndex(), 0)
+        self.assertEqual(self.window.history.toPlainText(), "")
+
+    def test_lesson_without_scenes_only_free_talk(self) -> None:
+        lesson12 = load_lesson(default_lesson_path())
+        self.assertEqual(lesson12.scenes, ())
+        self._select_lesson(lesson12)  # история пуста — подтверждения нет
+        _pump(0.1)
+        combo = self.window.scene_combo
+        self.assertEqual(combo.count(), 1)
+        self.assertEqual(combo.itemText(0), "Свободная беседа")
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertIsNone(self.controller.scene)
 
 
 if __name__ == "__main__":

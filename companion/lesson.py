@@ -8,7 +8,11 @@
 * ``topics`` — список тем и конструкций для изучения, хотя бы одна;
 * ``phrases`` — список английских фраз (строки), может быть пустым;
 * ``words`` — список английских слов и устойчивых сочетаний (строки),
-  может быть пустым.
+  может быть пустым;
+* ``scenes`` — необязательный список ролевых сцен: каждый объект —
+  непустые строки ``id``, ``name``, ``teacher_role``, ``student_role``,
+  ``start_message``; ``id`` уникален в пределах урока. Поле отсутствует —
+  урок поддерживает только свободную беседу.
 
 Уроки лежат в папке ``lessons/`` (JSON-файлы). ``load_lessons()``
 загружает ВСЕ уроки из папки (натуральный порядок по имени файла:
@@ -31,11 +35,28 @@ from typing import Any
 #: Уровни урока (согласованный формат).
 LEVELS = ("Elementary", "Pre-Intermediate", "Intermediate", "Advanced")
 
-_KNOWN = ("id", "level", "name", "topics", "phrases", "words")
+_KNOWN = ("id", "level", "name", "topics", "phrases", "words", "scenes")
+
+#: Поля ролевой сцены (все — непустые строки).
+_SCENE_FIELDS = ("id", "name", "teacher_role", "student_role", "start_message")
 
 
 class LessonError(ValueError):
     """Урок не найден, не читается или имеет отсутствующие/неверные поля."""
+
+
+@dataclass(frozen=True)
+class SceneSpec:
+    """Ролевая сцена урока (список ``Lesson.scenes``).
+
+    Все поля — непустые строки; ``id`` уникален в пределах урока.
+    """
+
+    id: str
+    name: str
+    teacher_role: str
+    student_role: str
+    start_message: str
 
 
 @dataclass(frozen=True)
@@ -48,6 +69,7 @@ class Lesson:
     topics: tuple[str, ...]
     phrases: tuple[str, ...]
     words: tuple[str, ...]
+    scenes: tuple[SceneSpec, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +105,60 @@ def _string_list(data: dict, key: str, errors: list[str], min_items: int) -> tup
         else:
             errors.append(f"{key}[{i}]: обязательное непустое строковое значение")
     return tuple(items)
+
+
+def _scenes(data: dict, errors: list[str]) -> tuple[SceneSpec, ...]:
+    """Необязательное поле ``scenes``: ролевые сцены урока.
+
+    Каждая сцена — объект с непустыми строковыми полями
+    ``id/name/teacher_role/student_role/start_message``; ``id`` уникален
+    в пределах урока. Поле отсутствует — урок только со свободной
+    беседой. Ошибки указывают поле и номер сцены (``scenes[N].field``).
+    """
+    value = data.get("scenes")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        errors.append(
+            "scenes: список ролевых сцен (объекты с полями id, name, "
+            "teacher_role, student_role, start_message)"
+        )
+        return ()
+    scenes: list[SceneSpec] = []
+    seen_ids: dict[str, int] = {}
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            errors.append(
+                f"scenes[{i}]: объект с полями id, name, teacher_role, "
+                "student_role, start_message"
+            )
+            continue
+        unknown = sorted(set(item) - set(_SCENE_FIELDS))
+        if unknown:
+            errors.append(f"scenes[{i}]: неизвестные поля: " + ", ".join(unknown))
+        fields: dict[str, str] = {}
+        ok = True
+        for field in _SCENE_FIELDS:
+            text = item.get(field)
+            if _is_text(text):
+                fields[field] = text
+            else:
+                errors.append(
+                    f"scenes[{i}].{field}: обязательное непустое строковое поле"
+                )
+                ok = False
+        if not ok:
+            continue
+        scene_id = fields["id"]
+        if scene_id in seen_ids:
+            errors.append(
+                f"scenes[{i}].id: дублируется с scenes[{seen_ids[scene_id]}] — "
+                "id уникален в пределах урока"
+            )
+            continue
+        seen_ids[scene_id] = i
+        scenes.append(SceneSpec(**fields))
+    return tuple(scenes)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +228,7 @@ def load_lesson(path: str | Path) -> Lesson:
     topics = _string_list(data, "topics", errors, min_items=1)
     phrases = _string_list(data, "phrases", errors, min_items=0)
     words = _string_list(data, "words", errors, min_items=0)
+    scenes = _scenes(data, errors)
 
     if errors:
         raise LessonError("Урок некорректен: " + "; ".join(errors))
@@ -163,6 +240,7 @@ def load_lesson(path: str | Path) -> Lesson:
         topics=topics,
         phrases=phrases,
         words=words,
+        scenes=scenes,
     )
 
 

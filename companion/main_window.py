@@ -63,6 +63,11 @@ class MainWindow(QMainWindow):
         # Пока доступен один урок (hw12); список растёт добавлением JSON.
         self.lesson_combo = QComboBox()
         self.lesson_combo.setMinimumWidth(250)
+        # Выбор сцены: «Свободная беседа» (None) + сцены текущего урока
+        # (данные — SceneSpec). Источник состояния сцены — этот выбор.
+        self.scene_combo = QComboBox()
+        self.scene_combo.setMinimumWidth(200)
+        self.scene_combo.setEnabled(False)
         self.new_session_button = QPushButton("Новое занятие")
 
         self.record_button = QPushButton("Записать")
@@ -111,6 +116,7 @@ class MainWindow(QMainWindow):
         self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
         self.new_session_button.clicked.connect(self.on_new_session)
         self.lesson_combo.currentIndexChanged.connect(self._on_lesson_changed)
+        self.scene_combo.currentIndexChanged.connect(self._on_scene_changed)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(self.message_input)
@@ -136,6 +142,8 @@ class MainWindow(QMainWindow):
         lesson_layout = QHBoxLayout()
         lesson_layout.addWidget(QLabel("Урок:"))
         lesson_layout.addWidget(self.lesson_combo, 1)
+        lesson_layout.addWidget(QLabel("Сцена:"))
+        lesson_layout.addWidget(self.scene_combo, 1)
         lesson_layout.addWidget(self.new_session_button)
 
         layout = QVBoxLayout()
@@ -194,6 +202,9 @@ class MainWindow(QMainWindow):
             self.controller.set_lesson(self.lessons[0])
         else:
             self.lesson_combo.setPlaceholderText("Не удалось загрузить уроки")
+        # Список сцен выбранного урока (свободная беседа по умолчанию);
+        # программное обновление — без отправки сообщений.
+        self._refresh_scene_combo()
         if errors:
             detail = "; ".join(errors)
             if self.lessons:
@@ -214,11 +225,13 @@ class MainWindow(QMainWindow):
         return True
 
     def _update_session_gate(self) -> None:
-        """«Новое занятие» и смена урока — только после завершения операций."""
+        """«Новое занятие», смена урока и смена сцены — только после
+        завершения операций."""
         has_lessons = self.lesson_combo.count() > 0
         idle = self._operations_idle()
         self.new_session_button.setEnabled(has_lessons and idle)
         self.lesson_combo.setEnabled(has_lessons and idle)
+        self.scene_combo.setEnabled(has_lessons and idle)
 
     def on_new_session(self) -> None:
         """«Новое занятие»: чистая история + выбранный урок.
@@ -266,6 +279,73 @@ class MainWindow(QMainWindow):
         with QSignalBlocker(self.lesson_combo):
             self.lesson_combo.setCurrentIndex(index)
 
+    # --- Выбор сцены (комбо «Сцена» — источник состояния) ---------------
+
+    def _refresh_scene_combo(self) -> None:
+        """Перестраивает список сцен текущего урока: «Свободная беседа»
+        (первый пункт, данные None) + сцены урока (данные — ``SceneSpec``).
+
+        Программное обновление: сигналы комбо на время перестроения
+        блокированы, выбор возвращается на «Свободную беседу» — сообщений
+        НЕ отправляется. Вызывается при загрузке уроков, новом занятии и
+        подтверждённой смене урока (сцена завершается — комбо сбрасывается).
+        """
+        lesson = self.controller.lesson
+        scenes = lesson.scenes if lesson is not None else ()
+        with QSignalBlocker(self.scene_combo):
+            self.scene_combo.clear()
+            self.scene_combo.addItem("Свободная беседа", None)
+            for spec in scenes:
+                self.scene_combo.addItem(spec.name, spec)
+            self.scene_combo.setCurrentIndex(0)
+
+    def _restore_scene_combo(self) -> None:
+        """Возвращает комбо сцен к сцене контроллера (None — «Свободная
+        беседа»); установка пункта не вызывает ``_on_scene_changed``
+        повторно (сигналы на время установки заблокированы)."""
+        current = self.controller.scene
+        index = 0
+        for i in range(self.scene_combo.count()):
+            spec = self.scene_combo.itemData(i)
+            if current is None:
+                match = spec is None
+            else:
+                match = spec is not None and spec.id == current.id
+            if match:
+                index = i
+                break
+        with QSignalBlocker(self.scene_combo):
+            self.scene_combo.setCurrentIndex(index)
+
+    def _on_scene_changed(self) -> None:
+        """Выбор сцены в комбо (источник состояния — пользователь).
+
+        «Свободная беседа» завершает сцену сразу, БЕЗ автоматической
+        реплики. Сцена — контроллер устанавливает её и отправляет стартовую
+        реплику (ровно один запрос); историю чата сохраняет. Переключение
+        заблокировано, пока идут операции (тот же затвор, что смена урока);
+        сбой отправки (например, файл промпта не читается) — комбо и сцена
+        возвращаются к прежним.
+        """
+        spec = self.scene_combo.currentData()
+        if spec is None:
+            self.controller.clear_scene()
+            self.status_label.setText("Свободная беседа")
+            self._update_session_gate()
+            return
+        current = self.controller.scene
+        if current is not None and current.id == spec.id:
+            return  # та же сцена активна — повторной отправки нет
+        if not self._operations_idle():
+            self._restore_scene_combo()
+            return
+        if self.controller.select_scene(spec):
+            self.status_label.setText(f"Сцена: {spec.name}")
+        else:
+            # Отправку начать нельзя: прежний пункт и прежняя сцена.
+            self._restore_scene_combo()
+        self._update_session_gate()
+
     def _confirm_new_session(self, question_text: str) -> bool:
         """Пустая история — подтверждения не требуется; непустая — диалог."""
         if not self.controller.history:
@@ -281,6 +361,9 @@ class MainWindow(QMainWindow):
         self.controller.set_lesson(lesson)
         self.controller.reset_history()
         self.history.clear()
+        # Сцена завершена (свободная беседа): комбо — на первый пункт,
+        # список — сцены НОВОГО урока (без отправки сообщений).
+        self._refresh_scene_combo()
         self.status_label.setText(f"Новое занятие: {lesson.name} · {lesson.level}")
         self._update_session_gate()
 
