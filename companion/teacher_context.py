@@ -1,61 +1,95 @@
-"""Системный контекст преподавателя из урока (companion/lesson.py).
+"""Системный контекст преподавателя: файл промпта + урок + режим разговора.
 
 Собирает системный контекст, который ``SessionController`` передаёт в
 Ollama вместе с историей разговора (поле ``system``). Контекст — НЕ
 часть чата: в окно выводятся только реплики пользователя и
 преподавателя.
 
-Состав: уровень и темы урока, фразы, слова + согласованные правила
-учебного поведения преподавателя:
-* фразы и слова урока — МАТЕРИАЛ ДЛЯ ПРАКТИКИ УЧЕНИКА: преподаватель
-  создаёт поводы для их использования, а НЕ читает список как свой
-  сценарий и не произносит всё; текущая ситуация определяет, какие
-  выражения уместны для каждой роли; реплики преподавателя могут
-  включать часть материала, когда это естественно для его роли;
-* перед мини-ситуацией — коротко обозначить роли и место (например:
-  ученик — гость отеля, преподаватель — администратор); роли
-  сохраняются, пока ситуация явно не завершена;
-* преподаватель задаёт сведения о вымышленной ситуации (цены, время
-  завтрака, наличие номеров и удобств); вопрос ученику опирается
-  ТОЛЬКО на уже сообщённые сведения, его предпочтения или действие,
-  которое он может выполнить;
-* ученик отвечает «I don't know» — сначала проверяется, достаточно ли
-  у него информации, недостающее сообщается; языковая трудность —
-  короткая английская подсказка, затем начало фразы, затем полный
-  пример; после помощи ученику дают возможность попробовать самому;
-* практика разными способами: ученик задаёт вопросы, выражает
-  пожелания, просит, отвечает и уточняет;
-* реплики короткие, обычно 1–3 предложения;
-* один вопрос за раз;
-* принимаются подходящие по смыслу формулировки, даже если они
-  отличаются от фраз урока;
-* небольшие ошибки не исправляются после каждой реплики;
-* смысл непонятен → спокойный уточняющий вопрос;
-* спокойная поддержка: без шуток и сарказма, обычный текст —
-  без эмодзи и декоративных символов;
-* преподаватель отвечает ТОЛЬКО на английском, даже если пользователь
-  пишет/говорит по-русски или просит перевод; непонятно — объяснить
-  проще на английском (пример, перефразирование); ответ по-русски —
-  мягкое приглашение выразить мысль на английском + английская
-  подсказка.
+Постоянные инструкции преподавателя — в ``prompts/teacher.txt``
+(UTF-8, редактируется пользователем) и читаются ПЕРЕД КАЖДЫМ запросом
+(не кэшируются): правка файла подхватывается со следующего запроса.
+Путь разрешается относительно приложения (корень проекта), запуск из
+другой рабочей папки загрузку не ломает. Файл отсутствует, пуст или
+не читается — ``TeacherPromptError`` с путём; отправка блокируется,
+повтор после исправления работает. ``{level}`` в файле подставляется
+уровнем выбранного урока.
+
+Состав системного сообщения:
+* текст файла (идентичность + учебные и языковые правила + правила
+  режимов разговора и маркера сцены);
+* блок урока: ``Lesson: name``, ``Student level``, темы, фразы, слова
+  (материал ученика);
+* актуальный режим разговора: сцена активна — её имя и роли, иначе —
+  свободная беседа. Состояние сцены хранит и определяет
+  ``SessionController`` (по маркеру ``[SCENE:...]`` в ответе
+  преподавателя; маркер из ответа убирается — в чат, озвучивание и
+  историю не попадает).
 """
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
 from .lesson import Lesson
 
 
-def build_teacher_context(lesson: Lesson) -> str:
-    """Системный контекст для Ollama на основе урока.
+class TeacherPromptError(ValueError):
+    """Файл промпта преподавателя отсутствует, пуст или не читается."""
 
-    Чистая функция: без Qt и сети — легко проверять в тестах.
+
+@dataclass(frozen=True)
+class Scene:
+    """Активная ролевая сцена; ``roles`` — свободный текст ролей."""
+
+    name: str
+    roles: str = ""
+
+
+def teacher_prompt_path() -> Path:
+    """Путь к ``prompts/teacher.txt`` относительно приложения (корень
+    проекта — запуск из другой рабочей папки загрузку не ломает)."""
+    return Path(__file__).resolve().parent.parent / "prompts" / "teacher.txt"
+
+
+def load_teacher_prompt(path: str | Path | None = None) -> str:
+    """Читает постоянный промпт преподавателя — без кэша, заново.
+
+    Бросает ``TeacherPromptError`` (со путём): файл отсутствует,
+    пуст (только пробельные) или не читается.
     """
-    lines: list[str] = []
-    lines.append(
-        "You are an English teacher running a live conversation "
-        "practice session. You play a simple role in a short invented "
-        "situation; the student practices English."
-    )
+    path = Path(path) if path is not None else teacher_prompt_path()
+    if not path.is_file():
+        raise TeacherPromptError(
+            f"Файл промпта преподавателя не найден: {path}"
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TeacherPromptError(
+            f"Файл промпта преподавателя не читается ({path}): {exc}"
+        ) from exc
+    if not text.strip():
+        raise TeacherPromptError(
+            f"Файл промпта преподавателя пуст: {path}"
+        )
+    return text
+
+
+def build_teacher_context(
+    lesson: Lesson,
+    scene: Scene | None = None,
+    prompt_path: str | Path | None = None,
+) -> str:
+    """Системный контекст для Ollama: промпт файла + урок + режим.
+
+    Промпт читается из файла ПЕРЕД каждым запросом (``{level}``
+    подставляется уровнем урока). Чистая функция: без Qt и сети —
+    легко проверять в тестах.
+    """
+    text = load_teacher_prompt(prompt_path).replace("{level}", lesson.level)
+    lines: list[str] = [text.rstrip(), ""]
     lines.append(f"Lesson: {lesson.name}")
     lines.append(f"Student level: {lesson.level}")
     lines.append("")
@@ -71,76 +105,58 @@ def build_teacher_context(lesson: Lesson) -> str:
         lines.append("Vocabulary from the lesson (the student's practice material):")
         lines.append(", ".join(lesson.words))
     lines.append("")
-    lines.append("Teaching rules:")
-    lines.append(
-        "- The lesson phrases and vocabulary are the student's practice "
-        "material. Do not read the list as your own script and do not "
-        "say all of it: the current situation decides which expressions "
-        "are natural for each role."
-    )
-    lines.append(
-        "- Create opportunities for the student to use the lesson "
-        "material. Your role lines may include some of it when it is "
-        "natural for your role."
-    )
-    lines.append(
-        "- Before a mini-situation, briefly set the roles and the place "
-        "(for example: \"You are a guest, I am the hotel "
-        "receptionist\"). Keep the roles until the situation clearly "
-        "ends."
-    )
-    lines.append(
-        "- You provide the invented facts of the situation: prices, "
-        "breakfast time, room availability, amenities. Ask the student "
-        "only about what they can know or do: facts you have already "
-        "given, their preferences, or an action they can take."
-    )
-    lines.append(
-        "- If the student says \"I don't know\": first check that they "
-        "have enough information and give any missing facts. If it is a "
-        "language difficulty, give a short English hint; if that is not "
-        "enough, suggest a phrase starter, then a full example. After "
-        "helping, let the student try again on their own."
-    )
-    lines.append(
-        "- Vary the practice: the student asks questions, expresses "
-        "wishes, makes requests, answers and asks for clarification."
-    )
-    lines.append(
-        "- Accept answers that make sense even if they differ from the "
-        "lesson phrases."
-    )
-    lines.append(
-        f"- Keep your speech at the {lesson.level} level: vocabulary "
-        "and grammar only."
-    )
-    lines.append("- Keep answers short: usually 1-3 sentences.")
-    lines.append("- Ask at most one question at a time.")
-    lines.append(
-        "- Do not correct small mistakes after every reply; keep the flow."
-    )
-    lines.append(
-        "- If the meaning is unclear, ask one short, calm clarifying question."
-    )
-    lines.append(
-        "- Keep a calm, supportive tone; no jokes, sarcasm or slang unless "
-        "the student starts it."
-    )
-    lines.append(
-        "- Use plain text only: no emojis and no decorative symbols."
-    )
-    lines.append("")
-    lines.append("Language rules (strict):")
-    lines.append(
-        "- Answer ONLY in English, even if the student writes or speaks "
-        "in Russian or asks for a translation."
-    )
-    lines.append(
-        "- If the student does not understand, explain more simply in "
-        "English: give a short example or rephrase."
-    )
-    lines.append(
-        "- If the student replies in Russian, gently invite them to say "
-        "the same thought in English and help with an English hint."
-    )
+    if scene is not None:
+        lines.append("Conversation mode: role-play scene is ACTIVE.")
+        lines.append(f"Scene: {scene.name}")
+        if scene.roles:
+            lines.append(f"Roles: {scene.roles}")
+        lines.append(
+            "Keep the roles and the situation while the scene is active; "
+            "the scene ends only when the student clearly finishes it."
+        )
+    else:
+        lines.append(
+            "Conversation mode: free talk (no role-play scene is active). "
+            "Continue as the teacher-conversation partner; the student's "
+            "topic may be discussed."
+        )
     return "\n".join(lines)
+
+
+#: Маркер сцены — последняя непустая строка ответа преподавателя.
+_SCENE_MARKER = re.compile(r"^\[SCENE:(.+?)\]$")
+
+
+def parse_scene_marker(text: str) -> tuple[str, str | None]:
+    """Возвращает ``(текст_без_маркера, маркер_или_None)``.
+
+    Маркер — последняя непустая строка вида ``[SCENE:...]``:
+    ``free`` (свободная беседа) или ``<имя>|<роли>`` (сцена активна).
+    Из ответа маркер убирается: в чат, озвучивание и историю он не
+    попадает. Маркер не на последней строке (или отсутствует) —
+    текст возвращается как есть.
+    """
+    lines = text.splitlines()
+    marker: str | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if not lines[i].strip():
+            continue
+        match = _SCENE_MARKER.match(lines[i].strip())
+        if match:
+            marker = match.group(1).strip()
+            del lines[i]
+        break
+    return "\n".join(lines), marker
+
+
+def scene_from_marker(marker: str | None) -> Scene | None:
+    """``free``/пусто/отсутствует → ``None`` (свободная беседа);
+    иначе ``Scene(name, roles)`` (``name|roles`` разбивается по
+    первому ``|``)."""
+    if not marker:
+        return None
+    name, _, roles = marker.partition("|")
+    name = name.strip()
+    if not name or name.lower() == "free":
+        return None
+    return Scene(name=name, roles=roles.strip())

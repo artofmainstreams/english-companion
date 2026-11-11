@@ -1,9 +1,17 @@
+from pathlib import Path
+
 from PySide6.QtCore import QObject, Signal
 
 from .lesson import Lesson
 from .message import Message
 from .ollama_client import OllamaClient
-from .teacher_context import build_teacher_context
+from .teacher_context import (
+    Scene,
+    TeacherPromptError,
+    build_teacher_context,
+    parse_scene_marker,
+    scene_from_marker,
+)
 
 
 class SessionController(QObject):
@@ -13,7 +21,12 @@ class SessionController(QObject):
     # перерисовывает чат целиком из истории + реплики в работе.
     history_changed = Signal()
 
-    def __init__(self, client: OllamaClient, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        client: OllamaClient,
+        parent: QObject | None = None,
+        prompt_path: str | Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.client = client
         self.models: list[str] = []
@@ -21,6 +34,15 @@ class SessionController(QObject):
         # Урок задаёт системный контекст преподавателя (level, темы,
         # фразы, слова). Без урока отправка недоступна.
         self.lesson: Lesson | None = None
+        # Файл постоянных инструкций преподавателя: None — prompts/
+        # teacher.txt приложения; читается ПЕРЕД каждым запросом.
+        self.prompt_path = prompt_path
+        # Активная ролевая сцена; None — свободная беседа. Состояние
+        # определяет КОНТРОЛЛЕР по маркеру [SCENE:...] в ответе
+        # преподавателя (маркер из ответа убирается); текстовый файл
+        # задаёт поведение преподавателя (когда сцены начинаются/
+        # завершаются, как вести свободную беседу).
+        self.scene: Scene | None = None
         # Только успешно завершённые обмены попадают в контекст.
         self.history: list[Message] = []
         self.loading_models = False
@@ -60,8 +82,14 @@ class SessionController(QObject):
         self.state_changed.emit()
 
     def reset_history(self) -> None:
-        """Новое занятие: история чата очищается (урок остаётся выбран)."""
+        """Новое занятие: история чата очищается (урок остаётся выбран).
+
+        Активная сцена завершается: новое занятие начинается в режиме
+        свободной беседы (преподаватель предлагает сцену сам — после
+        согласия ученика).
+        """
         self.history = []
+        self.scene = None
         self.status = "Готов"
         self.state_changed.emit()
 
@@ -115,8 +143,10 @@ class SessionController(QObject):
         (pending мог быть уже отменён — «остановить текущий ответ»). Без
         аргумента цель берётся из текущего состояния.
 
-        Возвращает ``False``: нет цели, текст пуст или запрос нельзя
-        отправить (модель/урок не выбраны).
+        Возвращает ``False``: нет цели, текст пуст, запрос нельзя
+        отправить (модель/урок не выбраны) или файл промпта не читается
+        (причина с путём — в ``status``); в этих случаях история не
+        трогается.
         """
         new_text = (new_text or "").strip()
         if target is None:
@@ -124,6 +154,14 @@ class SessionController(QObject):
         if not new_text or target is None:
             return False
         if not self.selected_model or self.lesson is None:
+            return False
+        # Промпт читается ДО любых изменений истории: при ошибке файла
+        # прежний обмен остаётся на месте.
+        try:
+            system = self.system_context()
+        except TeacherPromptError as exc:
+            self.status = f"{exc} Повторите отправку после исправления."
+            self.state_changed.emit()
             return False
         index = None
         for i in range(len(self.history) - 1, -1, -1):
@@ -148,7 +186,7 @@ class SessionController(QObject):
         self.client.send_chat(
             self.selected_model,
             [*base, replaced],
-            system=self.system_context(),
+            system=system,
         )
         return True
 
@@ -167,10 +205,20 @@ class SessionController(QObject):
 
     def retry_last_user_message(self) -> bool:
         """Повторяет запрос для сохранённой реплики БЕЗ её дублирования:
-        реплика уже в чате — уходит только новый запрос к Ollama."""
+        реплика уже в чате — уходит только новый запрос к Ollama.
+
+        Файл промпта не читается — повтор не отправляется, причина
+        (с путём) — в ``status``; состояние не меняется.
+        """
         if self._retry_message is None or self.busy:
             return False
         if not self.selected_model or self.lesson is None:
+            return False
+        try:
+            system = self.system_context()
+        except TeacherPromptError as exc:
+            self.status = f"{exc} Повторите отправку после исправления."
+            self.state_changed.emit()
             return False
         self._pending_message = self._retry_message
         self.generating_reply = True
@@ -179,7 +227,7 @@ class SessionController(QObject):
         self.client.send_chat(
             self.selected_model,
             [*self.history, self._retry_message],
-            system=self.system_context(),
+            system=system,
         )
         return True
 
@@ -216,31 +264,56 @@ class SessionController(QObject):
         text = text.strip()
         if not text or not self.can_send:
             return False
+        try:
+            system = self.system_context()
+        except TeacherPromptError as exc:
+            # Файл промпта отсутствует/пуст/не читается: понятная
+            # ошибка с путём; реплика в чат НЕ попадает, повтор —
+            # после исправления (файл перечитывается при каждой отправке).
+            self.status = f"{exc} Повторите отправку после исправления."
+            self.state_changed.emit()
+            return False
         self._pending_message = Message("user", text)
         self._request_model = self.selected_model
         self.generating_reply = True
         self.status = f"Думаю · {self._request_model}…"
         self.message_added.emit(self._pending_message)
         self.state_changed.emit()
-        # Системный контекст преподавателя (урок) уходит вместе с
-        # историей, но в чат НЕ попадает — только в запрос к Ollama.
+        # Системный контекст преподавателя (промпт + урок + режим)
+        # уходит вместе с историей, но в чат НЕ попадает — только в
+        # запрос к Ollama.
         self.client.send_chat(
             self._request_model,
             [*self.history, self._pending_message],
-            system=self.system_context(),
+            system=system,
         )
         return True
 
     def system_context(self) -> str:
-        """Системный контекст для Ollama; пустая строка, если урока нет."""
+        """Системный контекст для Ollama; пустая строка, если урока нет.
+
+        Промпт преподавателя читается из файла ПЕРЕД каждым запросом
+        (``self.prompt_path`` — None: ``prompts/teacher.txt``
+        приложения). Файл отсутствует/пуст/не читается —
+        ``TeacherPromptError`` с путём (ловят точки отправки).
+        Активная сцена добавляет имя и роли; иначе — свободная беседа.
+        """
         if self.lesson is None:
             return ""
-        return build_teacher_context(self.lesson)
+        return build_teacher_context(
+            self.lesson, scene=self.scene, prompt_path=self.prompt_path
+        )
 
     def _on_chat_completed(self, text: str) -> None:
         if self._pending_message is None:
             return
-        answer = Message("assistant", text, self._request_model)
+        # Маркер сцены (последняя строка ответа) — команда контроллеру
+        # о режиме разговора; из ответа (чат, озвучивание, история) он
+        # убирается. Маркера нет — состояние сцены не меняется.
+        clean_text, marker = parse_scene_marker(text)
+        if marker is not None:
+            self.scene = scene_from_marker(marker)
+        answer = Message("assistant", clean_text, self._request_model)
         self.history.extend([self._pending_message, answer])
         self._pending_message = None
         self._retry_message = None

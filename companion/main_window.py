@@ -469,10 +469,15 @@ class MainWindow(QMainWindow):
         if self.controller.send_message(text):
             self.status_label.setText("Отправлено; отвечаю…")
         else:
-            # can_send было True, но отправка не прошла — причина в статусе.
-            self.status_label.setText(
-                f"Отправка не прошла, повторите. Распознанный текст: «{text}»."
+            # can_send было True, но отправка не прошла — причина в
+            # статусе контроллера (например, файл промпта: путь и
+            # повтор после исправления); не затираем.
+            reason = self.controller.status
+            prefix = (
+                f"{reason} " if reason and reason != "Готов"
+                else "Отправка не прошла, повторите. "
             )
+            self.status_label.setText(f"{prefix}Распознанный текст: «{text}».")
         self._update_record_gate()
 
     def _on_stt_failed(self, message: str) -> None:
@@ -575,14 +580,20 @@ class MainWindow(QMainWindow):
         self._rerecord_active = False
         had_pending = self._rerecord_had_pending
         target = self._rerecord_restore
+        # Причина сбоя замены (например, файл промпта: путь) — в статусе
+        # контроллера; сохраняем ДО restore_pending (он меняет статус).
+        detail = self.controller.status
         self._rerecord_restore = None
         self._rerecord_had_pending = False
         if had_pending and target is not None:
             self.controller.restore_pending(target)
         self.audio.unsuppress_reply()
-        self.status_label.setText(
-            f"Перезапись не завершена ({reason}): прежний обмен сохранён."
-        )
+        if reason == "замена не прошла" and detail and detail != "Готов":
+            self.status_label.setText(f"{detail} Прежний обмен сохранён.")
+        else:
+            self.status_label.setText(
+                f"Перезапись не завершена ({reason}): прежний обмен сохранён."
+            )
         self._update_record_gate()
         self._update_rerecord_gates()
 
