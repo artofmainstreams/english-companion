@@ -399,6 +399,149 @@ class TestSceneMode(ControllerBase):
         self.assertIn("free talk", _last_system(self.send_mock))
 
 
+class TestSceneRewrite(ControllerBase):
+    """Перезапись реплики: сцена восстанавливается до исходного обмена."""
+
+    def _complete(self, user_text: str, reply_text: str) -> None:
+        self.assertTrue(self.controller.send_message(user_text))
+        self.controller.client.chat_completed.emit(reply_text)
+        _pump(0.02)
+
+    def test_rewrite_uses_free_after_scene_reply(self) -> None:
+        """Свободная беседа → сцена: замена несёт СВОБОДНУЮ беседу."""
+        self._complete(
+            "I'm looking for a room",
+            "You are a guest, I am the receptionist.\n"
+            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]",
+        )
+        self.assertIsNotNone(self.controller.scene, "ответ установил сцену")
+
+        # Удаляемый ответ мог сменить сцену — используем сцену ДО обмена.
+        self.assertTrue(self.controller.replace_last_user_message("I need a room"))
+        system = _last_system(self.send_mock)
+        self.assertIn("free talk (no role-play scene is active)", system)
+        self.assertNotIn("role-play scene is ACTIVE", system)
+        # Сцена контроллера восстановлена до обмена (удалённый ответ не в силе).
+        self.assertIsNone(self.controller.scene)
+        # Ответ без маркера сцену не меняет.
+        self.controller.client.chat_completed.emit("Sure. How many nights?")
+        _pump(0.02)
+        self.assertIsNone(self.controller.scene)
+
+    def test_rewrite_uses_scene_after_free_reply(self) -> None:
+        """Сцена → свободная беседа: замена несёт АКТИВНУЮ сцену."""
+        self._complete(
+            "I'm looking for a room",
+            "You are a guest, I am the receptionist.\n"
+            "[SCENE:hotel check-in|you are the receptionist, the student is the guest]",
+        )
+        self.assertIsNotNone(self.controller.scene)
+        # Второй ход в сцене; ответ завершает её (свободная беседа).
+        self._complete(
+            "What is the price?",
+            "It is fifty dollars. Thanks, that's all.\n[SCENE:free]",
+        )
+        self.assertIsNone(self.controller.scene, "ответ завершил сцену")
+
+        # Перезапись второго хода: сцена ДО обмена была АКТИВНА.
+        self.assertTrue(self.controller.replace_last_user_message("How much is it?"))
+        system = _last_system(self.send_mock)
+        self.assertIn("role-play scene is ACTIVE", system)
+        self.assertIn("Scene: hotel check-in", system)
+        self.assertNotIn("free talk (no role-play scene is active)", system)
+        # Сцена контроллера восстановлена до обмена.
+        self.assertIsNotNone(self.controller.scene)
+        self.assertEqual(self.controller.scene.name, "hotel check-in")
+
+    def test_rewrite_prompt_error_preserves_history_and_scene(self) -> None:
+        """Сбой чтения промпта: история и сцена сохраняются, запрос не ушёл."""
+        self._complete(
+            "I'm looking for a room",
+            "You are a guest.\n[SCENE:hotel check-in|you are the receptionist]",
+        )
+        self.assertIsNotNone(self.controller.scene)
+        history_before = list(self.controller.history)
+        scene_before = self.controller.scene
+
+        os.remove(self.prompt_file)
+        self.assertFalse(self.controller.replace_last_user_message("I need a room"))
+        self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
+        # История и сцена не тронуты.
+        self.assertEqual(self.controller.history, history_before)
+        self.assertEqual(self.controller.scene, scene_before)
+
+    def test_retry_after_failed_rewrite_uses_restored_scene(self) -> None:
+        """Замена прошла, запрос упал — повтор несёт восстановленную сцену."""
+        self._complete(
+            "I'm looking for a room",
+            "You are a guest.\n[SCENE:hotel check-in|you are the receptionist]",
+        )
+        self.assertIsNotNone(self.controller.scene)
+        # Перезапись: сцена ДО обмена = свободная беседа.
+        self.assertTrue(self.controller.replace_last_user_message("I need a room"))
+        self.assertIsNone(self.controller.scene)
+        # Новый запрос упал: реплика сохранена для повтора.
+        self.controller.client.chat_failed.emit("timeout")
+        self.assertIsNotNone(self.controller.retry_message)
+        # Повтор — восстановленная (свободная) сцена.
+        self.assertTrue(self.controller.retry_last_user_message())
+        system = _last_system(self.send_mock)
+        self.assertIn("free talk (no role-play scene is active)", system)
+        self.assertNotIn("role-play scene is ACTIVE", system)
+
+
+class TestModelSigning(ControllerBase):
+    """Ответ подписывается моделью, которой реально ушёл запрос."""
+
+    def test_retry_signed_with_current_model(self) -> None:
+        self.controller.selected_model = "m1"
+        self.assertTrue(self.controller.send_message("Hello"))
+        self.controller.client.chat_failed.emit("timeout")
+        self.assertIsNotNone(self.controller.retry_message)
+        # Модель сменили — повтор уйдёт m2, ответ подпишется m2.
+        self.controller.selected_model = "m2"
+        self.assertTrue(self.controller.retry_last_user_message())
+        self.assertEqual(self.send_mock.call_args.args[0], "m2")
+        self.controller.client.chat_completed.emit("Hi there.")
+        _pump(0.02)
+        answer = self.controller.history[-1]
+        self.assertEqual(answer.role, "assistant")
+        self.assertEqual(answer.model, "m2", "ответ подписан моделью запроса")
+
+    def test_replace_signed_with_current_model(self) -> None:
+        self.controller.selected_model = "m1"
+        self.assertTrue(self.controller.send_message("Hello"))
+        self.controller.client.chat_completed.emit("Hi there.")
+        _pump(0.02)
+        self.assertEqual(self.controller.history[-1].model, "m1")
+        # Модель сменили — замена уйдёт m2, ответ подпишется m2.
+        self.controller.selected_model = "m2"
+        self.assertTrue(self.controller.replace_last_user_message("Hello again"))
+        self.assertEqual(self.send_mock.call_args.args[0], "m2")
+        self.controller.client.chat_completed.emit("Hello again!")
+        _pump(0.02)
+        self.assertEqual(self.controller.history[-1].model, "m2")
+
+
+class TestNewSessionClearsRequestState(ControllerBase):
+    """«Новое занятие» (reset_history) сбрасывает состояние запроса."""
+
+    def test_reset_clears_pending_and_retry(self) -> None:
+        self.assertTrue(self.controller.send_message("Hello"))
+        self.controller.client.chat_failed.emit("timeout")
+        self.assertIsNotNone(self.controller.retry_message)
+
+        self.controller.reset_history()
+
+        self.assertIsNone(self.controller.retry_message)
+        self.assertIsNone(self.controller.pending_message)
+        self.assertEqual(self.controller.history, [])
+        self.assertFalse(self.controller.busy)
+        # Повтор после сброса не отправляет сообщение из прошлого занятия.
+        self.assertFalse(self.controller.retry_last_user_message())
+        self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
+
+
 class TestMarkerHelpers(unittest.TestCase):
     """parse_scene_marker / scene_from_marker — юнит-проверки."""
 

@@ -53,6 +53,11 @@ class SessionController(QObject):
         # БЕЗ дублирования сообщения в чате.
         self._retry_message: Message | None = None
         self._request_model = ""
+        # Сцена на момент отправки последней реплики пользователя (состояние
+        # ДО обмена). Ответ, что мог бы её изменить, приходит позже — а при
+        # перезаписи реплики и её ответа используется именно эта «до-обмена»
+        # сцена, а не текущая (её мог установить удаляемый ответ).
+        self._scene_at_send: Scene | None = None
         client.models_loaded.connect(self._on_models_loaded)
         client.models_failed.connect(self._on_models_failed)
         client.chat_completed.connect(self._on_chat_completed)
@@ -86,10 +91,19 @@ class SessionController(QObject):
 
         Активная сцена завершается: новое занятие начинается в режиме
         свободной беседы (преподаватель предлагает сцену сам — после
-        согласия ученика).
+        согласия ученика). Состояние предыдущего запроса сбрасывается:
+        незавершённая реплика и реплика для повтора из прошлого занятия
+        не отправляются (кнопка «Повторить запрос» становится недоступной;
+        запоздалые сигналы отменённого запроса контроллер и так отбрасывает
+        по пустому ``pending``).
         """
         self.history = []
         self.scene = None
+        self._scene_at_send = None
+        self._pending_message = None
+        self._retry_message = None
+        self._request_model = ""
+        self.generating_reply = False
         self.status = "Готов"
         self.state_changed.emit()
 
@@ -155,10 +169,16 @@ class SessionController(QObject):
             return False
         if not self.selected_model or self.lesson is None:
             return False
-        # Промпт читается ДО любых изменений истории: при ошибке файла
-        # прежний обмен остаётся на месте.
+        # Сцена ДО исходного обмена: зафиксирована при отправке цели
+        # (``_scene_at_send``). Удаляемый ответ преподавателя мог её
+        # изменить — состояние до обмена восстанавливается и используется
+        # в новом запросе (оба перехода: свободная беседа → сцена и
+        # сцена → свободная беседа).
+        scene = self._scene_at_send
+        # Промпт читается ДО любых изменений (сцены и истории): при ошибке
+        # файла прежние история и сцена сохраняются.
         try:
-            system = self.system_context()
+            system = self._system_context_for(scene)
         except TeacherPromptError as exc:
             self.status = f"{exc} Повторите отправку после исправления."
             self.state_changed.emit()
@@ -175,16 +195,22 @@ class SessionController(QObject):
             # Реплика ещё не в истории (ответ не пришёл) — история не чинится.
             base = list(self.history)
         self.discard_pending()
+        # Замена проходит: сцену восстанавливаем до исходного обмена и
+        # фиксируем модель, которой реально уходит запрос (эта же модель
+        # подпишет новый ответ).
+        self.scene = scene
+        self._scene_at_send = scene
+        self._request_model = self.selected_model
         replaced = Message("user", new_text)
         self.history = base
         self._pending_message = replaced
         self._retry_message = replaced
         self.generating_reply = True
-        self.status = f"Думаю · {self.selected_model}…"
+        self.status = f"Думаю · {self._request_model}…"
         self.history_changed.emit()
         self.state_changed.emit()
         self.client.send_chat(
-            self.selected_model,
+            self._request_model,
             [*base, replaced],
             system=system,
         )
@@ -221,11 +247,16 @@ class SessionController(QObject):
             self.state_changed.emit()
             return False
         self._pending_message = self._retry_message
+        # Повтор уйдёт той моделью, что выбрана сейчас (а не той, что была
+        # при первой отправке) — и эта же модель подпишет новый ответ.
+        # Сцена для запроса — текущая: ответ, способный её сменить, не пришёл.
+        self._request_model = self.selected_model
+        self._scene_at_send = self.scene
         self.generating_reply = True
-        self.status = f"Думаю · {self.selected_model}…"
+        self.status = f"Думаю · {self._request_model}…"
         self.state_changed.emit()
         self.client.send_chat(
-            self.selected_model,
+            self._request_model,
             [*self.history, self._retry_message],
             system=system,
         )
@@ -275,6 +306,9 @@ class SessionController(QObject):
             return False
         self._pending_message = Message("user", text)
         self._request_model = self.selected_model
+        # Сцена на момент отправки (состояние ДО обмена) — при возможной
+        # перезаписи этой реплики используется именно она.
+        self._scene_at_send = self.scene
         self.generating_reply = True
         self.status = f"Думаю · {self._request_model}…"
         self.message_added.emit(self._pending_message)
@@ -289,8 +323,9 @@ class SessionController(QObject):
         )
         return True
 
-    def system_context(self) -> str:
-        """Системный контекст для Ollama; пустая строка, если урока нет.
+    def _system_context_for(self, scene: Scene | None) -> str:
+        """Системный контекст для Ollama со сценой ``scene``; пустая строка,
+        если урока нет.
 
         Промпт преподавателя читается из файла ПЕРЕД каждым запросом
         (``self.prompt_path`` — None: ``prompts/teacher.txt``
@@ -301,8 +336,12 @@ class SessionController(QObject):
         if self.lesson is None:
             return ""
         return build_teacher_context(
-            self.lesson, scene=self.scene, prompt_path=self.prompt_path
+            self.lesson, scene=scene, prompt_path=self.prompt_path
         )
+
+    def system_context(self) -> str:
+        """Системный контекст для текущего состояния (текущая сцена)."""
+        return self._system_context_for(self.scene)
 
     def _on_chat_completed(self, text: str) -> None:
         if self._pending_message is None:

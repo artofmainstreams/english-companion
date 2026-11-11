@@ -234,7 +234,12 @@ class MainWindow(QMainWindow):
 
     def _on_lesson_changed(self) -> None:
         """Смена урока = начало нового занятия (с подтверждением при
-        непустой истории); история чата очищается."""
+        непустой истории); история чата очищается.
+
+        Отмена — комбо возвращается к уроку, который хранит контроллер
+        (история и сцена сохраняются); на время установки пункта сигналы
+        комбо заблокированы, чтобы обработчик не сработал повторно.
+        """
         lesson = self.lesson_combo.currentData()
         if lesson is None or lesson is self.controller.lesson:
             return
@@ -245,6 +250,21 @@ class MainWindow(QMainWindow):
             "и начать новое занятие?"
         ):
             self._start_new_session(lesson)
+        else:
+            self._restore_lesson_combo()
+
+    def _restore_lesson_combo(self) -> None:
+        """Возвращает комбо урока к ``controller.lesson`` (история/сцена
+        не трогаются); установка пункта не вызывает ``_on_lesson_changed``
+        повторно (сигналы на время установки заблокированы)."""
+        current = self.controller.lesson
+        index = 0
+        for i in range(self.lesson_combo.count()):
+            if self.lesson_combo.itemData(i) is current:
+                index = i
+                break
+        with QSignalBlocker(self.lesson_combo):
+            self.lesson_combo.setCurrentIndex(index)
 
     def _confirm_new_session(self, question_text: str) -> bool:
         """Пустая история — подтверждения не требуется; непустая — диалог."""

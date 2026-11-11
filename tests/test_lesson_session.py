@@ -48,7 +48,7 @@ from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
 from companion.session_controller import SessionController  # noqa: E402
 from companion.stt_engine import SttEngine  # noqa: E402
-from companion.teacher_context import build_teacher_context  # noqa: E402
+from companion.teacher_context import Scene, build_teacher_context  # noqa: E402
 from tests.stt_fakes import FakeBackend  # noqa: E402
 
 _QAPP: "QApplication | None" = None
@@ -493,6 +493,57 @@ class TestNewSession(LessonSessionBase):
         self.assertFalse(self.controller.busy)
         self.assertTrue(self.window.new_session_button.isEnabled())
         self.assertTrue(self.window.lesson_combo.isEnabled())
+
+
+class TestNewSessionClearsRequestState(LessonSessionBase):
+    """«Новое занятие»/смена урока сбрасывают состояние предыдущего запроса."""
+
+    def test_lesson_change_after_failure_blocks_retry(self) -> None:
+        """Сбой → смена урока: «Повторить запрос» старое сообщение не шлёт."""
+        self._allow_send()
+        self.window.message_input.setText("Hello")
+        self.window.send_message()
+        self.controller.client.chat_failed.emit("timeout")
+        self.assertIsNotNone(self.controller.retry_message)
+        self.assertTrue(self.window.retry_button.isEnabled())
+
+        # Смена урока = новое занятие (история пуста — подтверждения нет).
+        lesson = self._second_lesson()
+        self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson))
+        _pump(0.1)
+
+        self.assertIs(self.controller.lesson, lesson)
+        self.assertIsNone(self.controller.retry_message)
+        self.assertIsNone(self.controller.pending_message)
+        self.assertFalse(self.controller.busy)
+        self.assertFalse(self.window.retry_button.isEnabled())
+        # Повтор после смены занятия не отправляет сообщение прошлого занятия.
+        self.assertFalse(self.controller.retry_last_user_message())
+
+
+class TestLessonChangeCancel(LessonSessionBase):
+    """Отмена смены урока: комбо возвращается к уроку контроллера."""
+
+    def test_lesson_change_cancelled_restores_combo(self) -> None:
+        original = self.controller.lesson
+        self._exchange()
+        self.controller.scene = Scene(
+            name="hotel check-in", roles="you are the receptionist"
+        )
+        lesson = self._second_lesson()
+        question = mock.MagicMock(return_value=QMessageBox.StandardButton.No)
+        with mock.patch("companion.main_window.QMessageBox.question", question):
+            self.window.lesson_combo.setCurrentIndex(self._combo_index_of(lesson))
+        question.assert_called_once()
+        # Комбо и контроллер показывают один (прежний) урок.
+        self.assertIs(self.controller.lesson, original)
+        self.assertIs(self.window.lesson_combo.currentData(), original)
+        # История и сцена сохранены.
+        self.assertEqual(len(self.controller.history), 2)
+        self.assertEqual(
+            self.controller.scene,
+            Scene(name="hotel check-in", roles="you are the receptionist"),
+        )
 
 
 if __name__ == "__main__":
