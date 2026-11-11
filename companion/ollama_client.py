@@ -69,7 +69,14 @@ class OllamaClient(QObject):
         else:
             self.models_loaded.emit(names)
 
-    def send_chat(self, model: str, messages: list[Message]) -> None:
+    def send_chat(self, model: str, messages: list[Message], system: str = "") -> None:
+        """Отправить чат-запрос.
+
+        ``system`` — системный контекст (например, из урока): уходит
+        ПЕРВЫМ сообщением с ролью ``system``; история сообщений — после
+        него. В ``SessionController.history`` системный контекст НЕ
+        попадает (он собирается заново при каждой отправке).
+        """
         if self._chat_reply is not None:
             raise RuntimeError("Запрос уже выполняется")
         request = QNetworkRequest(
@@ -79,18 +86,44 @@ class OllamaClient(QObject):
             QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json"
         )
         request.setTransferTimeout(self.config.chat_timeout_ms)
+        payload_messages: list[dict] = []
+        if system:
+            payload_messages.append({"role": "system", "content": system})
+        payload_messages.extend(
+            {"role": message.role, "content": message.content}
+            for message in messages
+        )
         payload = {
             "model": model,
-            "messages": [
-                {"role": message.role, "content": message.content}
-                for message in messages
-            ],
+            "messages": payload_messages,
             "stream": False,
         }
         self._chat_reply = self.network.post(
             request, json.dumps(payload, ensure_ascii=False).encode("utf-8")
         )
         self._chat_reply.finished.connect(self._on_chat_completed)
+
+    def abort_chat(self) -> bool:
+        """Отменяет выполняющийся чат-запрос; его результат отбрасывается.
+
+        Используется, когда пользователь отменяет ответ (например, при
+        перезаписи реплики): ``finished`` отменённого запроса НЕ порождает
+        ``chat_completed``/``chat_failed`` (слот отключается до ``abort``).
+        Возвращает ``False``, если запроса в работе не было.
+        """
+        reply = self._chat_reply
+        if reply is None:
+            return False
+        self._chat_reply = None
+        try:
+            reply.finished.disconnect(self._on_chat_completed)
+        except (TypeError, RuntimeError):
+            pass  # слот уже отключён — нормально
+        abort = getattr(reply, "abort", None)
+        if callable(abort):
+            abort()
+        reply.deleteLater()
+        return True
 
     @staticmethod
     def parse_chat(payload: bytes) -> str:

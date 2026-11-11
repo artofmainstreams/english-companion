@@ -145,15 +145,16 @@ def _fake_mlx_modules() -> tuple[dict, "mock.Mock"]:
 
 class TestAppConfigDefaults(unittest.TestCase):
     def test_default_backend_is_mlx_large_v3(self) -> None:
-        """По умолчанию: mlx + whisper-large-v3-mlx, язык — авто, transcribe."""
+        """По умолчанию: mlx + whisper-large-v3-mlx, английская речь, transcribe."""
         config = AppConfig()
         self.assertEqual(config.stt_backend, "mlx")
         self.assertEqual(
             config.stt_mlx_model, "mlx-community/whisper-large-v3-mlx"
         )
-        self.assertIsNone(
+        self.assertEqual(
             config.stt_language,
-            "по умолчанию язык должен определяться автоматически (None)",
+            "en",
+            "голосовой ввод занятия рассчитан на английскую речь",
         )
         self.assertEqual(
             config.stt_task, "transcribe", "расшифровка, а не перевод"
@@ -232,27 +233,40 @@ class TestMlxBackend(MlxTestBase):
             task=self.config.stt_task,
         )
 
-    def test_transcribe_default_auto_language(self) -> None:
-        """language=None (дефолт) уходит в mlx_whisper АС-ЕСТЬ, не "en".
-
-        mlx_whisper при ``language=None`` и мультиязычной модели определяет
-        язык сам (первое окно записи) — русский остаётся русским.
-        """
+    def test_transcribe_default_english_language(self) -> None:
+        """language="en" (дефолт занятия) уходит в mlx_whisper АС-ЕСТЬ,
+        без подмены адаптером; task=transcribe."""
         modules, transcribe_fn = _fake_mlx_modules()
         with _SysModulesPatch(modules):
             backend = MlxBackend(self.config)
             backend.transcribe("mlx-model", self.audio_path)
         kwargs = transcribe_fn.call_args.kwargs
-        self.assertIs(
+        self.assertEqual(
             kwargs.get("language"),
-            None,
-            "language=None должен передаваться библиотеке, а не "
-            "заменяться на 'en' в адаптере",
+            "en",
+            "по умолчанию (занятие — английская речь) language='en' "
+            "должен передаваться библиотеке, а не подменяться в адаптере",
         )
         self.assertEqual(
             kwargs["task"], "transcribe", "расшифровка, а не перевод"
         )
         self.assertEqual(kwargs["path_or_hf_repo"], self.config.stt_mlx_model)
+
+    def test_transcribe_explicit_auto_language_none(self) -> None:
+        """Явное language=None (автоопределение) уходит в mlx_whisper
+        АС-ЕСТЬ — адаптер не подставляет дефолтный язык."""
+        modules, transcribe_fn = _fake_mlx_modules()
+        config = AppConfig(stt_language=None)
+        with _SysModulesPatch(modules):
+            backend = MlxBackend(config)
+            backend.transcribe("mlx-model", self.audio_path)
+        kwargs = transcribe_fn.call_args.kwargs
+        self.assertIs(
+            kwargs.get("language"),
+            None,
+            "явное None должно передаваться библиотеке (автоопределение)",
+        )
+        self.assertEqual(kwargs["task"], "transcribe")
 
     def test_transcribe_explicit_language_ru(self) -> None:
         """Явный язык ("ru") передаётся mlx_whisper без подмены."""
@@ -398,26 +412,39 @@ class TestFasterWhisperBackend(unittest.TestCase):
 
         return _transcribe, captured
 
-    def test_transcribe_default_auto_language(self) -> None:
-        """language=None (дефолт) уходит в faster-whisper АС-ЕСТЬ, не "en".
-
-        faster-whisper при ``language=None`` определяет язык сам — при
-        условии мультиязычной модели (base, а не base.en).
-        """
+    def test_transcribe_default_english_language(self) -> None:
+        """language="en" (дефолт занятия) уходит в faster-whisper АС-ЕСТЬ,
+        без подмены адаптером; task=transcribe."""
         effect, captured = self._transcribe_effect(["hello"])
         model = mock.Mock(name="model")
         model.transcribe.side_effect = effect
-        backend = FasterWhisperBackend(self.config)  # дефолт: language=None
+        backend = FasterWhisperBackend(self.config)  # дефолт: language="en"
         backend.transcribe(model, self.audio_path)
-        self.assertIs(
+        self.assertEqual(
             captured["language"],
-            None,
-            "language=None должен передаваться библиотеке, а не "
-            "заменяться на 'en' в адаптере",
+            "en",
+            "по умолчанию (занятие — английская речь) language='en' "
+            "должен передаваться библиотеке, а не подменяться в адаптере",
         )
         self.assertEqual(
             captured["task"], "transcribe", "расшифровка, а не перевод"
         )
+
+    def test_transcribe_explicit_auto_language_none(self) -> None:
+        """Явное language=None (автоопределение) уходит в faster-whisper
+        АС-ЕСТЬ — адаптер не подставляет дефолтный язык."""
+        effect, captured = self._transcribe_effect(["hello"])
+        model = mock.Mock(name="model")
+        model.transcribe.side_effect = effect
+        config = AppConfig(stt_backend="faster-whisper", stt_language=None)
+        backend = FasterWhisperBackend(config)
+        backend.transcribe(model, self.audio_path)
+        self.assertIs(
+            captured["language"],
+            None,
+            "явное None должно передаваться библиотеке (автоопределение)",
+        )
+        self.assertEqual(captured["task"], "transcribe")
 
     def test_transcribe_explicit_language_ru(self) -> None:
         """Явный язык ("ru") передаётся faster-whisper без подмены."""

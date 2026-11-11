@@ -187,6 +187,10 @@ class AudioController(QObject):
         # Флаг shutdown фасада: после него он не реагирует на сигналы
         # компонентов и не пускает новые операции.
         self._shutdown = False
+        # Готовый ответ временно недоступен для «Повторить ответ» (во время
+        # перезаписи реплики — старый ответ не повторять). Снимается
+        # ``unsuppress_reply()`` (отмена) или новым готовым ответом.
+        self._reply_suppressed = False
 
     # --- Свойства для интерфейса ------------------------------------------
 
@@ -235,9 +239,10 @@ class AudioController(QObject):
 
     @property
     def can_replay(self) -> bool:
-        """Можно «Повторить ответ»: аудио свободно и ответ готов."""
+        """Можно «Повторить ответ»: аудио свободно, ответ готов и не отменён."""
         return (
             not self._shutdown
+            and not self._reply_suppressed
             and self.state == self.IDLE
             and self.tts.has_reply
         )
@@ -271,6 +276,13 @@ class AudioController(QObject):
         if self._shutdown:
             return
         self.recorder.stop_recording()
+
+    def cancel_recording(self) -> None:
+        """Отменяет текущую запись: файл отбрасывается,
+        ``recording_completed`` не поднимается (STT не запускается)."""
+        if self._shutdown:
+            return
+        self.recorder.cancel_recording()
 
     def play(self) -> None:
         """Проигрывает последнюю готовую запись; запрещено во время записи."""
@@ -337,10 +349,15 @@ class AudioController(QObject):
 
         Новый запрос к Ollama и новый синтез НЕ выполняются — проигрывается
         тот же готовый файл (``TtsSynth.last_reply_path``). Запрещено,
-        пока идёт запись/воспроизведение, или если готового ответа нет
-        (причина публикуется в ``status``).
+        пока идёт запись/воспроизведение, если готового ответа нет
+        (причина публикуется в ``status``) или ответ отменён
+        (``suppress_reply`` — во время перезаписи).
         """
         if self._shutdown or self.state != self.IDLE:
+            return
+        if self._reply_suppressed:
+            self.status = "Повторять нечего: предыдущий ответ отменён."
+            self.state_changed.emit()
             return
         path = self.tts.last_reply_path
         if path is None:
@@ -353,6 +370,22 @@ class AudioController(QObject):
             return
         # Файл принадлежит синтезатору; плеер его не удаляет.
         self.player.play(path)
+
+    def suppress_reply(self) -> None:
+        """Делает готовый ответ недоступным для «Повторить ответ».
+
+        Применяется на время перезаписи реплики: старый голосовой ответ
+        не повторяется ни во время перезаписи, ни после подтверждённой
+        замены. Возвращает ``unsuppress_reply()``; снимается автоматически
+        новым готовым ответом.
+        """
+        self._reply_suppressed = True
+        self.state_changed.emit()
+
+    def unsuppress_reply(self) -> None:
+        """Возвращает «Повторить ответ», если готовый файл сохранился."""
+        self._reply_suppressed = False
+        self.state_changed.emit()
 
     def shutdown(self) -> None:
         """Останавливает запись, воспроизведение и синтез; разбирает слой.
@@ -454,6 +487,9 @@ class AudioController(QObject):
         """
         if self._shutdown:
             return
+        # Новый готовый ответ принадлежит текущему обмену: ограничение
+        # «не повторять старый» снимается — повтор воспроизведёт НОВЫЙ.
+        self._reply_suppressed = False
         if self._stream == "active":
             self.player.end_stream()
         elif self._stream == "pending":
