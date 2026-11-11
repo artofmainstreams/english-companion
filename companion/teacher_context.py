@@ -22,7 +22,7 @@ Ollama вместе с историей разговора (поле ``system``)
 * актуальный режим разговора: сцена активна — её имя (``SceneSpec.name``)
   и ОБЕ РОЛИ (``teacher_role``/``student_role``), иначе — свободная
   беседа. Режим — явный выбор пользователя (комбо «Сцена»), состояние
-  хранит ``SessionController`` (``select_scene``/``clear_scene``); ответ
+  хранит ``SessionController`` (``select_scene``/``exit_scene``); ответ
   модели режим НЕ меняет.
 """
 

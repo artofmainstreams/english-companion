@@ -47,7 +47,10 @@ from companion.lesson import Lesson, SceneSpec  # noqa: E402
 from companion.main_window import MainWindow  # noqa: E402
 from companion.message import Message  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
-from companion.session_controller import SessionController  # noqa: E402
+from companion.session_controller import (  # noqa: E402
+    FREE_TALK_EXIT_MESSAGE,
+    SessionController,
+)
 from companion.stt_engine import SttEngine  # noqa: E402
 from companion.teacher_context import (  # noqa: E402
     TeacherPromptError,
@@ -319,21 +322,47 @@ class TestSceneMode(ControllerBase):
         )
         self.assertIn("role-play scene is ACTIVE", kwargs["system"])
 
-    def test_clear_scene_ends_scene_without_reply(self) -> None:
+    def test_exit_scene_sends_farewell_line_once(self) -> None:
         spec = _scene_spec()
         self.assertTrue(self.controller.select_scene(spec))
         self.controller.client.chat_completed.emit("Welcome to the hotel.")
         _pump(0.02)
         self.assertIsNotNone(self.controller.scene)
-
-        # «Свободная беседа»: сцена завершается сразу, БЕЗ автоматической реплики.
         history_before = list(self.controller.history)
-        self.controller.clear_scene()
-        self.assertIsNone(self.controller.scene)
-        self.assertEqual(self.controller.history, history_before)
-        self.assertEqual(self.send_mock.call_count, 1, "запросов не добавилось")
 
-        # Следующий запрос — свободная беседа; история и материал сохранены.
+        # «Свободная беседа»: сцена снимается ДО отправки, прощальная
+        # реплика — как обычная реплика пользователя; ровно один запрос.
+        self.assertTrue(self.controller.exit_scene())
+        self.assertIsNone(self.controller.scene)
+        self.assertEqual(self.send_mock.call_count, 2, "ровно один запрос")
+        args, kwargs = self.send_mock.call_args
+        # История сохранена + прощальная реплика — в одном запросе.
+        self.assertEqual(
+            [m.content for m in args[1]],
+            [
+                spec.start_message,
+                "Welcome to the hotel.",
+                FREE_TALK_EXIT_MESSAGE,
+            ],
+        )
+        # Прощальная реплика ушла уже в режиме свободной беседы.
+        self.assertIn("free talk (no role-play scene is active)", kwargs["system"])
+        self.assertNotIn("role-play scene is ACTIVE", kwargs["system"])
+        # Реплика — в работе, в чате будет как обычная реплика «You».
+        self.assertEqual(
+            self.controller.pending_message, Message("user", FREE_TALK_EXIT_MESSAGE)
+        )
+
+        # Ответ пришёл: история = прежняя + прощальный обмен.
+        self.controller.client.chat_completed.emit("Sure — tell me about your trip.")
+        _pump(0.02)
+        self.assertEqual(len(self.controller.history), len(history_before) + 2)
+        self.assertEqual(
+            self.controller.history[-2].content, FREE_TALK_EXIT_MESSAGE
+        )
+        self.assertEqual(self.controller.history[-2].role, "user")
+
+        # Следующий запрос — свободная беседа; материал сохранён.
         self.assertTrue(self.controller.send_message("Tell me about your trip."))
         system = _last_system(self.send_mock)
         self.assertIn("free talk (no role-play scene is active)", system)
@@ -341,6 +370,12 @@ class TestSceneMode(ControllerBase):
         self.assertNotIn("Заселение в отель", system)
         self.assertIn("Урок 9", system)
         self.assertIn("reservation", system)
+
+    def test_exit_scene_without_scene_rejected(self) -> None:
+        # Сцены нет — «Свободная беседа» запрос не отправляет.
+        self.assertFalse(self.controller.exit_scene())
+        self.assertIsNone(self.controller.scene)
+        self.send_mock.assert_not_called()
 
     def test_model_reply_does_not_change_scene(self) -> None:
         spec = _scene_spec()
@@ -378,6 +413,20 @@ class TestSceneMode(ControllerBase):
         self.send_mock.assert_called_once()
         # Прежняя сцена восстановлена; причина — в статусе (с путём).
         self.assertEqual(self.controller.scene, spec_a)
+        self.assertIn(self.prompt_file, self.controller.status)
+
+    def test_exit_scene_prompt_error_keeps_scene(self) -> None:
+        spec = _scene_spec()
+        self.assertTrue(self.controller.select_scene(spec))
+        self.controller.client.chat_completed.emit("Sure, what name?")
+        _pump(0.02)
+
+        # Файл промпта не читается: выход из сцены НЕ начинается —
+        # прежняя сцена восстановлена, запрос не ушёл.
+        os.remove(self.prompt_file)
+        self.assertFalse(self.controller.exit_scene())
+        self.send_mock.assert_called_once()
+        self.assertEqual(self.controller.scene, spec)
         self.assertIn(self.prompt_file, self.controller.status)
 
     def test_select_scene_while_busy_rejected(self) -> None:
@@ -565,7 +614,7 @@ class TestWindowIntegration(ControllerBase):
         self.assertEqual(self.audio.speak_reply.call_count, 1)
         self.assertIsNotNone(self.controller.scene)
 
-    def test_free_talk_selection_clears_scene_without_reply(self) -> None:
+    def test_free_talk_selection_sends_farewell_line(self) -> None:
         combo = self.window.scene_combo
         spec = combo.itemData(1)
         self.assertIsNotNone(spec)
@@ -575,11 +624,19 @@ class TestWindowIntegration(ControllerBase):
         _pump(0.05)
         self.assertIsNotNone(self.controller.scene)
         history_before = list(self.controller.history)
-        # «Свободная беседа» — сцена завершается сразу, без автоматической реплики.
+        # «Свободная беседа» — сцена завершается, прощальная реплика
+        # отправляется как обычная реплика «You» (ровно один запрос).
         combo.setCurrentIndex(0)
         _pump(0.05)
         self.assertIsNone(self.controller.scene)
-        self.assertEqual(self.controller.history, history_before)
+        self.assertEqual(self.send_mock.call_count, 2, "ровно один запрос")
+        self.assertIn(
+            f"You: {FREE_TALK_EXIT_MESSAGE}", self.window.history.toPlainText()
+        )
+        self.assertIn("free talk (no role-play scene is active)",
+                      _last_system(self.send_mock))
+        # Прежняя история сохранена; новая реплика — в работе/чате.
+        self.assertEqual(len(self.controller.history), len(history_before))
 
     def test_prompt_error_restores_scene_combo_and_scene(self) -> None:
         combo = self.window.scene_combo

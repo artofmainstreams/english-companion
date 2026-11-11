@@ -7,6 +7,11 @@ from .message import Message
 from .ollama_client import OllamaClient
 from .teacher_context import TeacherPromptError, build_teacher_context
 
+#: Прощальная реплика при выходе из сцены (выбор «Свободная беседа»):
+#: уходит как обычная реплика пользователя, сцена при этом уже снята —
+#: запрос идёт в режиме «free talk».
+FREE_TALK_EXIT_MESSAGE = "Thanks, that's all, let's continue the conversation"
+
 
 class SessionController(QObject):
     state_changed = Signal()
@@ -33,9 +38,10 @@ class SessionController(QObject):
         self.prompt_path = prompt_path
         # Активная ролевая сцена; None — свободная беседа. Сцену задаёт
         # ЯВНО пользователь (комбо «Сцена» в окне): ``select_scene``
-        # устанавливает её и отправляет стартовую реплику, ``clear_scene``
-        # завершает её. Ответ модели сцену НЕ меняет. Урок задаёт доступные
-        # сцены (``Lesson.scenes``) и системный контекст (уровень, материал).
+        # устанавливает её и отправляет стартовую реплику, ``exit_scene``
+        # завершает её и отправляет прощальную реплику. Ответ модели
+        # сцену НЕ меняет. Урок задаёт доступные сцены (``Lesson.scenes``)
+        # и системный контекст (уровень, материал).
         self.scene: SceneSpec | None = None
         # Только успешно завершённые обмены попадают в контекст.
         self.history: list[Message] = []
@@ -102,13 +108,32 @@ class SessionController(QObject):
         self.state_changed.emit()
         return False
 
-    def clear_scene(self) -> None:
-        """Завершает активную сцену (свободная беседа) сразу, БЕЗ
-        автоматической реплики и запроса: выбор «Свободная беседа» в
-        интерфейсе — источник состояния."""
-        if self.scene is not None:
-            self.scene = None
-            self.state_changed.emit()
+    def exit_scene(self) -> bool:
+        """Завершает активную сцену (свободная беседа) и отправляет
+        прощальную реплику как обычную реплику пользователя — ровно один
+        запрос; история чата сохраняется.
+
+        Сцена снимается ДО отправки, поэтому реплика уходит уже в режиме
+        «free talk» (учитель получает смену режима в контексте). Выбор
+        «Свободная беседа» в интерфейсе — источник состояния; если сцены
+        уже нет, запрос не уходит.
+
+        Возвращает ``False`` (сцена и состояние не меняются, запрос не
+        уходит): сцены нет, модель/урок не выбраны, идёт операция, либо
+        файл промпта не читается (причина с путём — в ``status``; повтор —
+        после исправления).
+        """
+        if self.scene is None or not self.can_send:
+            return False
+        previous = self.scene
+        self.scene = None
+        if self._send_text(FREE_TALK_EXIT_MESSAGE):
+            return True
+        # Отправку начать нельзя (например, файл промпта): возвращаем
+        # прежнюю сцену — окно восстановит прежний пункт списка.
+        self.scene = previous
+        self.state_changed.emit()
+        return False
 
     def reset_history(self) -> None:
         """Новое занятие: история чата очищается (урок остаётся выбран).

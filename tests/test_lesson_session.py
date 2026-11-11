@@ -47,7 +47,10 @@ from companion.lesson import (  # noqa: E402
 )
 from companion.main_window import MainWindow  # noqa: E402
 from companion.ollama_client import OllamaClient  # noqa: E402
-from companion.session_controller import SessionController  # noqa: E402
+from companion.session_controller import (  # noqa: E402
+    FREE_TALK_EXIT_MESSAGE,
+    SessionController,
+)
 from companion.stt_engine import SttEngine  # noqa: E402
 from companion.teacher_context import (  # noqa: E402
     TeacherPromptError,
@@ -632,7 +635,7 @@ class TestSceneSelection(LessonSessionBase):
         self.assertIn("role-play scene is ACTIVE",
                       send_mock.call_args.kwargs["system"])
 
-    def test_free_talk_selection_clears_scene_without_reply(self) -> None:
+    def test_free_talk_selection_sends_farewell_line(self) -> None:
         lesson = self._first_lesson()
         spec = lesson.scenes[0]
         self._allow_send()
@@ -641,14 +644,29 @@ class TestSceneSelection(LessonSessionBase):
         _pump(0.1)
         self.assertEqual(self.controller.scene, spec)
         history_before = list(self.controller.history)
+        # «Свободная беседа» — сцена завершается, прощальная реплика
+        # отправляется одним запросом как обычная реплика «You».
         self.window.scene_combo.setCurrentIndex(0)
         _pump(0.1)
         self.assertIsNone(self.controller.scene)
-        self.assertEqual(self.controller.history, history_before, "без новой реплики")
+        send_mock = self.controller.client.send_chat
+        self.assertEqual(send_mock.call_count, 2, "ровно один запрос")
+        self.assertIn(
+            f"You: {FREE_TALK_EXIT_MESSAGE}", self.window.history.toPlainText()
+        )
+        system = send_mock.call_args.kwargs["system"]
+        self.assertIn("free talk (no role-play scene is active)", system)
+        # Прежняя история сохранена.
+        self.assertEqual(len(self.controller.history), len(history_before))
+        # Ответ на прощальную реплику пришёл — запрос завершён.
+        self.controller.client.chat_completed.emit("Sure — tell me about your trip.")
+        _pump(0.1)
         # Следующий запрос — свободная беседа.
         self.assertTrue(self.controller.send_message("Tell me about your trip."))
-        system = self.controller.client.send_chat.call_args.kwargs["system"]
-        self.assertIn("free talk (no role-play scene is active)", system)
+        self.assertIn(
+            "free talk (no role-play scene is active)",
+            self.controller.client.send_chat.call_args.kwargs["system"],
+        )
 
     def test_model_reply_does_not_change_scene(self) -> None:
         lesson = self._first_lesson()
